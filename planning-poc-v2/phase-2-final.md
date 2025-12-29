@@ -34,7 +34,7 @@ Public API:
 - `compute_distances(logits, permutations, target)` - Returns `[batch]`
 
 ### tests/poc/test_gpu_random.py
-- 6 unit tests covering determinism, different seeds, unit vector, distance range
+- 13 unit tests covering determinism, different seeds, unit vector, distance range, permutation validity, CPU/GPU cross-device reproducibility
 - All tests passing
 
 ## Acceptance Criteria
@@ -51,7 +51,8 @@ Public API:
 
 - **Murmur3 over torch.Generator**: torch.Generator on CUDA is not portable across GPU architectures. Murmur3 is pure math, deterministic on any device.
 - **Box-Muller for normal distribution**: Standard transform from uniform to normal, using pairs of uniform randoms.
-- **Argsort for permutations**: `torch.argsort(uniform_randoms)` is fully parallel on GPU, unlike sequential Fisher-Yates.
+- **Argsort for permutations**: `torch.argsort(hashes, stable=True)` on integer hashes directly - no float conversion needed. Fully parallel on GPU, unlike sequential Fisher-Yates. Stable sort required for CPU/GPU reproducibility.
 - **Int32 overflow handling**: Seeds from SHA256 can exceed signed int32 range; converted using `seed - 0x100000000` when needed.
 - **Seed format**: Uses 8 hex chars (32 bits) from SHA256, sufficient entropy for murmur3 seed.
+- **GPU generation over CPU**: Direct GPU generation avoids CPU->GPU transfer overhead. Sequential loop is acceptable for typical batch sizes (32-64); vectorization possible if needed for larger batches.
 

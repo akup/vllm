@@ -82,8 +82,9 @@ def generate_permutations(
     for i, nonce in enumerate(nonces):
         seed_str = f"{block_hash}_{public_key}_nonce_{nonce}_permutations"
         seed = _seed_from_string(seed_str)
-        uniform = _uniform(seed, vocab_size, device)
-        result[i] = torch.argsort(uniform)
+        indices = torch.arange(vocab_size, device=device, dtype=torch.int32)
+        hashes = _murmur3_32(indices, seed)
+        result[i] = torch.argsort(hashes, stable=True)
 
     return result
 
