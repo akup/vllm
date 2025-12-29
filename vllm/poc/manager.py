@@ -157,13 +157,7 @@ class PoCManager:
         """Create minimal attention metadata for prefill-only forward pass.
         
         Uses PAD_SLOT_ID for all slots, so KV cache writes are skipped.
-        This is fine for single-step PoC computation where we don't need
-        to cache KV values for subsequent decode steps.
-        
-        TODO: For multistep inference with KV cache, need to:
-        1. Allocate real KV cache blocks via CacheEngine
-        2. Compute proper slot_mapping from block_tables
-        3. Track seq positions across steps
+        See class docstring for multistep KV cache TODO.
         """
         num_tokens = batch_size * seq_len
         seq_lens = [seq_len] * batch_size

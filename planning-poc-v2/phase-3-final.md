@@ -43,7 +43,7 @@ Key methods:
 ### vllm/poc/sender.py
 
 - `PoCCallbackSender` - Sends valid batches to callback URL with retry logic
-- Fire-and-forget pattern - failures logged but don't block generation
+- Failed batches stored and retried on subsequent calls; failures don't block generation
 
 ### tests/poc/test_manager.py
 

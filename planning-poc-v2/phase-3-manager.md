@@ -52,6 +52,10 @@ PoCCallbackSender
 
 Note: State is stateless across restarts. If vLLM restarts during a round, the round is lost.
 
+### Nonce Iteration Simplification
+
+NOTE: Rethink - Original implementation has `group_id` / `n_groups` concept. Probably we should get it back as single MLNode still might have multiple instances of vllm ...
+
 ## Model Access
 
 vLLM loads the model once at startup. We access it via:
@@ -125,9 +129,10 @@ logger = logging.getLogger(__name__)
 
 
 class PoCCallbackSender:
-    """Sends valid batches to callback URL (async, non-blocking).
+    """Sends valid batches to callback URL with retry logic.
     
-    Callback failures are logged but don't block generation (fire-and-forget).
+    Failed batches are stored and retried on subsequent send calls.
+    Callback failures don't block generation.
     """
     
     def __init__(self, callback_url: str, r_target: float, fraud_threshold: float):
