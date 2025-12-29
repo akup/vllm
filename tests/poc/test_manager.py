@@ -394,6 +394,49 @@ class TestPoCManagerBatch:
         batch = manager.run_batch()
         
         assert len(batch) == 0
+    
+    def test_run_batch_with_state_returns_full_result(self, manager, mock_executor):
+        """run_batch_with_state returns batch + state for optimized loop."""
+        config = PoCConfig(
+            block_hash="test_hash",
+            block_height=100,
+            public_key="test_node",
+            r_target=0.25,  # First two will be valid
+            batch_size=4,
+            seq_len=32,
+            node_id=0,
+        )
+        manager.init_round(config)
+        manager.start_generate()
+        
+        result = manager.run_batch_with_state()
+        
+        assert result["should_continue"] is True
+        assert result["state"] == "GENERATING"
+        assert result["public_key"] == "test_node"
+        assert result["block_hash"] == "test_hash"
+        assert result["block_height"] == 100
+        assert result["node_id"] == 0
+        assert result["nonces"] == [0, 1, 2, 3]
+        assert result["distances"] == [0.1, 0.2, 0.3, 0.4]
+        assert result["valid_nonces"] == [0, 1]  # d < 0.25
+        assert result["valid_distances"] == [0.1, 0.2]
+    
+    def test_run_batch_with_state_returns_false_when_not_generating(self, manager):
+        """run_batch_with_state returns should_continue=False when not generating."""
+        config = PoCConfig(
+            block_hash="test_hash",
+            block_height=100,
+            public_key="test_node",
+            r_target=0.5,
+        )
+        manager.init_round(config)
+        # Don't call start_generate()
+        
+        result = manager.run_batch_with_state()
+        
+        assert result["should_continue"] is False
+        assert result["state"] == "IDLE"
 
 
 class TestPoCManagerValidate:

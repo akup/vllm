@@ -23,9 +23,9 @@ stats = {
 }
 
 
-@app.post("/callback/batch")
-async def receive_batch(request: Request) -> dict:
-    """Receive a generated/validated batch from vLLM PoC."""
+@app.post("/generated")
+async def receive_generated(request: Request) -> dict:
+    """Receive a generated batch from vLLM PoC (matching original API)."""
     body = await request.json()
     
     timestamp = datetime.now().isoformat()
@@ -56,6 +56,22 @@ async def receive_batch(request: Request) -> dict:
     print()
     
     return {"status": "OK", "received": len(nonces)}
+
+
+@app.post("/validated")
+async def receive_validated(request: Request) -> dict:
+    """Receive a validated batch from vLLM PoC (matching original API)."""
+    body = await request.json()
+    
+    timestamp = datetime.now().isoformat()
+    
+    print(f"[{timestamp}] Received VALIDATED batch:")
+    print(f"  Block: {body.get('block_hash', 'N/A')[:16]}...")
+    print(f"  Nonces: {len(body.get('nonces', []))}")
+    print(f"  Fraud detected: {body.get('fraud_detected', 'N/A')}")
+    print()
+    
+    return {"status": "OK"}
 
 
 @app.get("/batches")
@@ -101,7 +117,9 @@ def main():
     args = parser.parse_args()
     
     print(f"Starting PoC Callback Receiver on {args.host}:{args.port}")
-    print(f"Callback URL: http://localhost:{args.port}/callback/batch")
+    print(f"Callback URL: http://localhost:{args.port}")
+    print(f"  POST /generated - receive generated batches")
+    print(f"  POST /validated - receive validated batches")
     print()
     
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")

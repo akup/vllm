@@ -19,7 +19,7 @@ Production nodes already run inference using vLLM. We want:
 | Decision | Rationale |
 |----------|-----------|
 | Same deployed model | Access via `model_runner.model`, no re-deployment |
-| Blocking inference | Return 503 during PoC (simplicity for v1) |
+| Blocking inference | Return 503 during PoC (Phase 6 investigates parallel) |
 | API prefix `/api/v1/pow/*` | Migration compatibility with original service |
 | GPU-native random | All generation on GPU for performance |
 | Isolated module `vllm/poc/` | Easy to migrate, minimal vLLM coupling |
@@ -62,10 +62,12 @@ vLLM Server (running)
 
 ### Model Access Path
 
+Uses `collective_rpc` for TP/PP support:
 ```
-engine_client.engine.model_executor.driver_worker.model_runner.model
-                                                              │
-                                                    Qwen3ForCausalLM
+engine_client → RPCPoCRequest → MQLLMEngine
+    → PoCManager.run_batch()
+    → model_executor.collective_rpc(poc_forward_batch)
+    → Workers execute on GPU
 ```
 
 ## PoC Round Flow
@@ -73,7 +75,7 @@ engine_client.engine.model_executor.driver_worker.model_runner.model
 ```
 1. Client → POST /api/v1/pow/init/generate {block_hash, r_target, ...}
 2. Server → init_round() sets config, start_generate() sets state = GENERATING
-3. Server → Block inference (503) during GENERATING and VALIDATING
+3. Server → Block inference (503) during GENERATING and VALIDATING [Phase 6]
 4. Loop (background task with tracking):
    - Generate inputs_embeds from nonces (GPU)
    - model.forward(inputs_embeds) → hidden_states

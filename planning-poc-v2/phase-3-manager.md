@@ -58,13 +58,17 @@ NOTE: Rethink - Original implementation has `group_id` / `n_groups` concept. Pro
 
 ## Model Access
 
-vLLM loads the model once at startup. We access it via:
+**Note:** Phase 4 updated this to use `collective_rpc` for TP/PP support. The direct model access shown below is outdated.
 
 ```python
-# In api_server.py, after init_app_state:
-model = engine_client.engine.model_executor.driver_worker.model_runner.model
+# Phase 4 approach - via collective_rpc in PoCManager:
+model_executor = engine_client.engine.model_executor
 model_config = engine_client.engine.model_config
 vllm_config = engine_client.engine.vllm_config
+
+manager = PoCManager(model_executor, model_config, vllm_config)
+# Uses collective_rpc internally for TP/PP support
+# See vllm/poc/worker_ops.py for actual GPU execution
 ```
 
 ## Forward Context
@@ -248,21 +252,14 @@ See full implementation in `vllm/poc/manager.py`.
 
 ## Integration Point
 
-In `api_server.py`, after model is loaded:
+**Note:** Phase 4 moved integration to the engine multiprocessing layer. PoCManager is created in `MQLLMEngine` and accessed via RPC, not directly in api_server.
 
 ```python
-from vllm.poc.manager import PoCManager
+# Phase 4 approach - in vllm/engine/multiprocessing/engine.py:
+# PoCManager is created lazily when first PoC request arrives
+# API routes use engine_client.poc_request() to communicate via RPC
 
-async def init_app_state(engine_client, vllm_config, state, args):
-    # ... existing code ...
-    
-    if args.enable_poc:
-        # v0 API access pattern
-        # TODO: Update for v1 compatibility - model access path differs in v1 engine
-        model = engine_client.engine.model_executor.driver_worker.model_runner.model
-        model_config = engine_client.engine.model_config
-        vllm_config = engine_client.engine.vllm_config
-        state.poc_manager = PoCManager(model, model_config, vllm_config)
+# See phase-4-integration.md for full architecture
 ```
 
 ## Directory Structure After Phase 3

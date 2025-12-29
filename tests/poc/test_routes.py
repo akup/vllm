@@ -10,6 +10,8 @@ from vllm.poc.routes import (
     PoCValidateRequest,
     PoCStatusResponse,
 )
+
+# Note: PoCValidateResponse was removed as /validate is now fire-and-forget
 from vllm.poc.config import PoCState
 
 
@@ -244,18 +246,14 @@ class TestPoCStatus:
 
 
 class TestPoCValidate:
-    def test_validate_nonces(self, client, mock_engine_client):
-        """Test validating nonces."""
+    def test_validate_nonces_fire_and_forget(self, client, mock_engine_client):
+        """Test validating nonces (fire-and-forget, matching original API)."""
         # Mock status to show round is configured
         def mock_poc_request(action, payload):
             if action == "status":
                 return {"state": PoCState.VALIDATING.value}
-            elif action == "validate":
-                return {
-                    "nonces": [1, 2, 3],
-                    "distances": [0.1, 0.6, 0.2],
-                    "valid": [True, False, True],
-                }
+            elif action == "queue_validation":
+                return {"status": "queued"}
             return {}
         
         mock_engine_client.poc_request.side_effect = mock_poc_request
@@ -271,9 +269,8 @@ class TestPoCValidate:
         
         assert response.status_code == 200
         data = response.json()
-        assert data["nonces"] == [1, 2, 3]
-        assert data["distances"] == [0.1, 0.6, 0.2]
-        assert data["valid"] == [True, False, True]
+        # Fire-and-forget returns just status OK
+        assert data["status"] == "OK"
 
     def test_validate_requires_init(self, client, mock_engine_client):
         """Test that validate requires round to be configured."""

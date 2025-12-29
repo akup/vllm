@@ -1,15 +1,12 @@
-import asyncio
 import time
 import torch
-from typing import Optional, List, Tuple, TYPE_CHECKING
+from typing import Optional, List, Tuple, Dict, Any, TYPE_CHECKING
 from dataclasses import dataclass
 
 from .config import PoCConfig, PoCState
 from .data import ProofBatch
-from .gpu_random import generate_target
 
 if TYPE_CHECKING:
-    from .sender import PoCCallbackSender
     from vllm.config import VllmConfig
     from vllm.executor.executor_base import ExecutorBase
 
@@ -56,8 +53,6 @@ class PoCManager:
         self.valid_nonces: List[int] = []
         self.valid_distances: List[float] = []
         self._nonce_counter = 0
-        self._generation_task: Optional[asyncio.Task] = None
-        self._callback_sender: Optional['PoCCallbackSender'] = None
     
     def _get_device(self) -> torch.device:
         """Get device from driver worker."""
@@ -70,26 +65,11 @@ class PoCManager:
         if self.state == PoCState.GENERATING:
             raise RuntimeError("Round already in progress")
         
-        if self._generation_task and not self._generation_task.done():
-            self._generation_task.cancel()
-            self._generation_task = None
-        
         self.config = config
         self.stats = PoCStats(start_time=time.time())
         self.valid_nonces = []
         self.valid_distances = []
         self._nonce_counter = config.node_id
-        
-        if config.callback_url:
-            from .sender import PoCCallbackSender
-            self._callback_sender = PoCCallbackSender(
-                callback_url=config.callback_url,
-                r_target=config.r_target,
-                fraud_threshold=config.fraud_threshold,
-            )
-        else:
-            self._callback_sender = None
-        
         self.state = PoCState.IDLE
     
     def start_generate(self) -> None:
@@ -102,21 +82,11 @@ class PoCManager:
         """Switch to VALIDATING state. Call after init_round()."""
         if self.config is None:
             raise RuntimeError("Round not initialized")
-        if self._generation_task and not self._generation_task.done():
-            self._generation_task.cancel()
-            self._generation_task = None
         self.state = PoCState.VALIDATING
     
     def stop_round(self) -> None:
-        """Stop current round and cancel any running tasks."""
-        if self._generation_task and not self._generation_task.done():
-            self._generation_task.cancel()
-            self._generation_task = None
+        """Stop current round."""
         self.state = PoCState.STOPPED
-    
-    def set_generation_task(self, task: asyncio.Task) -> None:
-        """Track the background generation task for cleanup."""
-        self._generation_task = task
     
     def get_next_nonces(self) -> List[int]:
         """Get next batch of nonces for this node."""
@@ -177,15 +147,40 @@ class PoCManager:
         
         return batch
     
-    async def run_batch_async(self) -> ProofBatch:
-        """Async version of run_batch. Sends to callback URL if configured."""
+    def run_batch_with_state(self) -> dict:
+        """Run batch and return result with state for continuation check.
+        
+        Returns both batch results and current state, enabling single RPC
+        per iteration in the generation loop (no separate status check needed).
+        """
+        if self.state != PoCState.GENERATING:
+            return {
+                "should_continue": False,
+                "state": self.state.value,
+            }
+        
         batch = self.run_batch()
-        if self._callback_sender and len(batch) > 0:
-            await self._callback_sender.send_generated(batch)
-        return batch
+        valid_batch = batch.sub_batch(self.config.r_target)
+        
+        return {
+            "should_continue": self.state == PoCState.GENERATING,
+            "state": self.state.value,
+            "public_key": self.config.public_key,
+            "block_hash": self.config.block_hash,
+            "block_height": self.config.block_height,
+            "node_id": self.config.node_id,
+            "nonces": batch.nonces,
+            "distances": batch.dist,
+            "valid_nonces": valid_batch.nonces,
+            "valid_distances": valid_batch.dist,
+        }
     
-    def validate(self, nonces: List[int], public_key: str) -> Tuple[List[float], List[bool]]:
-        """Validate nonces by recomputing distances using collective_rpc."""
+    def validate(self, nonces: List[int], public_key: str, 
+                 received_dist: Optional[List[float]] = None) -> Dict[str, Any]:
+        """Validate nonces by recomputing distances using collective_rpc.
+        
+        Returns dict with validation results and fraud detection.
+        """
         if self.config is None:
             raise RuntimeError("No round configured")
         
@@ -210,7 +205,32 @@ class PoCManager:
         if result is None:
             raise RuntimeError("No result from validation")
         
-        return result["distances"], result["valid"]
+        computed_dist = result["distances"]
+        valid_flags = result["valid"]
+        
+        # Update validation stats
+        self.stats.total_checked += len(nonces)
+        self.stats.total_valid += sum(valid_flags)
+        
+        # Check for fraud if received distances provided
+        fraud_detected = False
+        if received_dist is not None and len(received_dist) == len(computed_dist):
+            # Fraud = claimed valid (dist < r_target) but computed invalid (dist >= r_target)
+            for recv, comp in zip(received_dist, computed_dist):
+                if recv < self.config.r_target and comp >= self.config.r_target:
+                    fraud_detected = True
+                    break
+        
+        return {
+            "nonces": nonces,
+            "computed_distances": computed_dist,
+            "received_distances": received_dist or [],
+            "valid": valid_flags,
+            "fraud_detected": fraud_detected,
+            "public_key": public_key,
+            "block_hash": self.config.block_hash,
+            "block_height": self.config.block_height,
+        }
     
     def get_status(self) -> dict:
         return {

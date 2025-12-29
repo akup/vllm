@@ -421,6 +421,10 @@ class MQLLMEngine:
                 "pow_status": manager.get_status(),
             }
 
+        elif action == "run_batch_with_state":
+            # Optimized version that returns batch + state in single call
+            return manager.run_batch_with_state()
+
         elif action == "validate":
             nonces = payload.get("nonces", [])
             public_key = payload.get("public_key", "")
@@ -430,6 +434,15 @@ class MQLLMEngine:
                 "distances": distances,
                 "valid": valid,
             }
+
+        elif action == "queue_validation":
+            # Validate nonces and return results for callback
+            nonces = payload.get("nonces", [])
+            public_key = payload.get("public_key", "")
+            received_dist = payload.get("dist", None)
+            
+            result = manager.validate(nonces, public_key, received_dist)
+            return result
 
         else:
             raise ValueError(f"Unknown PoC action: {action}")

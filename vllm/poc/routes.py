@@ -1,14 +1,20 @@
 """PoC (Proof of Compute) API routes for vLLM server."""
 import asyncio
-from typing import List, Optional
+import logging
+from typing import List, Optional, Dict, Any
 
 from fastapi import APIRouter, Request, HTTPException
 from pydantic import BaseModel
 
 from .config import PoCState
-from .data import ProofBatch
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/pow", tags=["PoC"])
+
+# Module-level state for PoC tasks
+_poc_tasks: Dict[int, Dict[str, Any]] = {}
+_callback_url: Optional[str] = None  # Current callback URL for validation results
 
 
 class PoCInitRequest(BaseModel):
@@ -44,12 +50,6 @@ class PoCValidateRequest(BaseModel):
     node_id: int
 
 
-class PoCValidateResponse(BaseModel):
-    nonces: List[int]
-    distances: List[float]
-    valid: List[bool]
-
-
 async def get_engine_client(request: Request):
     """Get engine client from request app state."""
     engine_client = getattr(request.app.state, 'engine_client', None)
@@ -63,6 +63,118 @@ async def check_poc_enabled(request: Request):
     poc_enabled = getattr(request.app.state, 'poc_enabled', False)
     if not poc_enabled:
         raise HTTPException(status_code=503, detail="PoC not enabled")
+
+
+async def _cancel_poc_tasks(app_id: int):
+    """Cancel running PoC tasks for an app."""
+    tasks = _poc_tasks.pop(app_id, None)
+    if tasks:
+        tasks["stop_event"].set()
+        if tasks.get("gen_task"):
+            tasks["gen_task"].cancel()
+            try:
+                await tasks["gen_task"]
+            except asyncio.CancelledError:
+                pass
+        if tasks.get("send_task"):
+            tasks["send_task"].cancel()
+            try:
+                await tasks["send_task"]
+            except asyncio.CancelledError:
+                pass
+
+
+async def _generation_loop(
+    engine_client,
+    batch_queue: asyncio.Queue,
+):
+    """Runs batches continuously, puts valid results in queue for callback sender."""
+    try:
+        while True:
+            result = await engine_client.poc_request("run_batch_with_state", {})
+            
+            if not result.get("should_continue", False):
+                break
+            
+            # Put valid batch in queue for sender (non-blocking)
+            if result.get("valid_nonces"):
+                await batch_queue.put({
+                    "public_key": result["public_key"],
+                    "block_hash": result["block_hash"],
+                    "block_height": result["block_height"],
+                    "nonces": result["valid_nonces"],
+                    "dist": result["valid_distances"],
+                    "node_id": result["node_id"],
+                })
+    except asyncio.CancelledError:
+        pass
+
+
+async def _callback_sender_loop(
+    batch_queue: asyncio.Queue,
+    callback_url: str,
+    stop_event: asyncio.Event,
+):
+    """Sends batches from queue to callback URL."""
+    import aiohttp
+    
+    async with aiohttp.ClientSession() as session:
+        while not stop_event.is_set():
+            try:
+                # Wait for batch with timeout to check stop_event
+                batch = await asyncio.wait_for(
+                    batch_queue.get(),
+                    timeout=1.0
+                )
+                try:
+                    await session.post(
+                        f"{callback_url}/generated",
+                        json=batch,
+                        timeout=aiohttp.ClientTimeout(total=10)
+                    )
+                    logger.debug(f"Callback sent to {callback_url}/generated")
+                except Exception as e:
+                    logger.warning(f"Callback failed: {e}")
+            except asyncio.TimeoutError:
+                continue  # Check stop_event
+            except asyncio.CancelledError:
+                break
+
+
+async def _start_generation_tasks(
+    request: Request,
+    engine_client,
+    callback_url: Optional[str],
+):
+    """Start generation loop and optional callback sender tasks."""
+    app_id = id(request.app)
+    
+    # Cancel existing tasks
+    await _cancel_poc_tasks(app_id)
+    
+    # Create queue and stop event
+    batch_queue: asyncio.Queue = asyncio.Queue()
+    stop_event = asyncio.Event()
+    
+    # Start generation loop
+    gen_task = asyncio.create_task(
+        _generation_loop(engine_client, batch_queue)
+    )
+    
+    # Start callback sender if URL provided
+    send_task = None
+    if callback_url:
+        send_task = asyncio.create_task(
+            _callback_sender_loop(batch_queue, callback_url, stop_event)
+        )
+    
+    # Store for cleanup
+    _poc_tasks[app_id] = {
+        "gen_task": gen_task,
+        "send_task": send_task,
+        "stop_event": stop_event,
+        "queue": batch_queue,
+    }
 
 
 @router.post("/init")
@@ -83,25 +195,16 @@ async def init_generate(request: Request, body: PoCInitRequest) -> dict:
     
     if body.node_id == -1 or body.node_count == -1:
         raise HTTPException(
-            status_code=400, 
+            status_code=400,
             detail="Node ID and node count must be set"
         )
     
-    # Initialize
+    # Initialize and start generating
     await engine_client.poc_request("init", body.model_dump())
-    
-    # Start generating
     result = await engine_client.poc_request("start_generate", {})
     
-    # Start background generation loop
-    task = asyncio.create_task(_generation_loop(engine_client))
-    
-    # Store task reference for cleanup
-    if not hasattr(request.app.state, '_poc_generation_task'):
-        request.app.state._poc_generation_task = None
-    if request.app.state._poc_generation_task:
-        request.app.state._poc_generation_task.cancel()
-    request.app.state._poc_generation_task = task
+    # Start background tasks
+    await _start_generation_tasks(request, engine_client, body.callback_url)
     
     return {"status": "OK", "pow_status": result.get("pow_status", {})}
 
@@ -109,13 +212,18 @@ async def init_generate(request: Request, body: PoCInitRequest) -> dict:
 @router.post("/init/validate")
 async def init_validate(request: Request, body: PoCInitRequest) -> dict:
     """Initialize PoC round and start validating."""
+    global _callback_url
     await check_poc_enabled(request)
     engine_client = await get_engine_client(request)
     
-    # Initialize
-    await engine_client.poc_request("init", body.model_dump())
+    # Store callback URL for validation results
+    _callback_url = body.callback_url
     
-    # Start validating
+    # Cancel any generation tasks
+    await _cancel_poc_tasks(id(request.app))
+    
+    # Initialize and start validating
+    await engine_client.poc_request("init", body.model_dump())
     result = await engine_client.poc_request("start_validate", {})
     
     return {"status": "OK", "pow_status": result.get("pow_status", {})}
@@ -134,14 +242,8 @@ async def start_generate(request: Request) -> dict:
     
     result = await engine_client.poc_request("start_generate", {})
     
-    # Start background generation loop
-    task = asyncio.create_task(_generation_loop(engine_client))
-    
-    if not hasattr(request.app.state, '_poc_generation_task'):
-        request.app.state._poc_generation_task = None
-    if request.app.state._poc_generation_task:
-        request.app.state._poc_generation_task.cancel()
-    request.app.state._poc_generation_task = task
+    # Start background tasks (no callback URL since round already initialized)
+    await _start_generation_tasks(request, engine_client, None)
     
     return {"status": "OK", "pow_status": result.get("pow_status", {})}
 
@@ -157,30 +259,12 @@ async def start_validate(request: Request) -> dict:
     if status.get("state") == PoCState.IDLE.value:
         raise HTTPException(status_code=400, detail="PoC not initialized")
     
-    # Cancel generation task if running
-    if hasattr(request.app.state, '_poc_generation_task'):
-        task = request.app.state._poc_generation_task
-        if task and not task.done():
-            task.cancel()
-        request.app.state._poc_generation_task = None
+    # Cancel generation tasks
+    await _cancel_poc_tasks(id(request.app))
     
     result = await engine_client.poc_request("start_validate", {})
     
     return {"status": "OK", "pow_status": result.get("pow_status", {})}
-
-
-async def _generation_loop(engine_client):
-    """Background task that runs batches until stopped."""
-    try:
-        while True:
-            status = await engine_client.poc_request("status", {})
-            if status.get("state") != PoCState.GENERATING.value:
-                break
-            
-            await engine_client.poc_request("run_batch", {})
-            await asyncio.sleep(0)  # Yield to event loop
-    except asyncio.CancelledError:
-        pass  # Normal cancellation on stop/reinit
 
 
 @router.post("/stop")
@@ -189,12 +273,8 @@ async def stop_round(request: Request) -> dict:
     await check_poc_enabled(request)
     engine_client = await get_engine_client(request)
     
-    # Cancel generation task if running
-    if hasattr(request.app.state, '_poc_generation_task'):
-        task = request.app.state._poc_generation_task
-        if task and not task.done():
-            task.cancel()
-        request.app.state._poc_generation_task = None
+    # Cancel generation tasks
+    await _cancel_poc_tasks(id(request.app))
     
     result = await engine_client.poc_request("stop", {})
     
@@ -211,11 +291,12 @@ async def get_status(request: Request) -> PoCStatusResponse:
     return PoCStatusResponse(**status)
 
 
-@router.post("/validate", response_model=PoCValidateResponse)
-async def validate_nonces(request: Request, body: PoCValidateRequest) -> PoCValidateResponse:
+@router.post("/validate")
+async def validate_nonces(request: Request, body: PoCValidateRequest) -> dict:
     """Validate submitted nonces by recomputing distances.
     
     Accepts full ProofBatch format (matching original API).
+    Results sent to callback_url/validated if configured.
     """
     await check_poc_enabled(request)
     engine_client = await get_engine_client(request)
@@ -225,14 +306,28 @@ async def validate_nonces(request: Request, body: PoCValidateRequest) -> PoCVali
     if status.get("state") == PoCState.IDLE.value:
         raise HTTPException(status_code=400, detail="No round configured")
     
-    result = await engine_client.poc_request("validate", {
-        "nonces": body.nonces,
+    # Validate and get results
+    result = await engine_client.poc_request("queue_validation", {
         "public_key": body.public_key,
+        "block_hash": body.block_hash,
+        "nonces": body.nonces,
+        "dist": body.dist,
     })
     
-    return PoCValidateResponse(
-        nonces=result["nonces"],
-        distances=result["distances"],
-        valid=result["valid"],
-    )
-
+    # Send callback if URL configured
+    global _callback_url
+    if _callback_url:
+        import aiohttp
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{_callback_url}/validated",
+                    json=result,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"Validation callback failed: {resp.status}")
+        except Exception as e:
+            logger.warning(f"Validation callback error: {e}")
+    
+    return {"status": "OK", "fraud_detected": result.get("fraud_detected", False)}
