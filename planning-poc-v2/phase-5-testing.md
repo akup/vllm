@@ -230,10 +230,14 @@ class TestValidation:
 
 
 class TestInferenceBlocking:
-    """Test that inference is blocked during PoC"""
+    """Test that inference is blocked during PoC.
+    
+    Phase 5: Inference blocked during GENERATING and VALIDATING (returns 503).
+    Phase 6: Will explore allowing inference during VALIDATING phase.
+    """
     
     def test_chat_returns_503(self, vllm_server, poc_client):
-        """Chat completion returns 503 during PoC"""
+        """Chat completion returns 503 during PoC (Phase 5 behavior)."""
         poc_client.start("hash1", "node1")
         time.sleep(0.5)
         

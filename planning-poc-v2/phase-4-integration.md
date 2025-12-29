@@ -295,3 +295,24 @@ VLLM_USE_V1=0 python scripts/poc_smoke_test.py
 - [x] Validation recomputes distances correctly
 - [x] All unit tests pass: `pytest tests/poc/ -v` (67 tests)
 - [x] Smoke test passes: `VLLM_USE_V1=0 python scripts/poc_smoke_test.py`
+- [x] E2E test passes: `python scripts/poc_e2e_test.py --models qwen llama`
+
+## E2E Test Script
+
+`scripts/poc_e2e_test.py` provides full integration testing:
+
+1. **Generation Phase**: Start server, generate nonces, collect valid ones
+2. **Restart Validation**: Restart server, validate same nonces produce same distances
+3. **Fraud Detection**: Verify wrong block_hash/public_key triggers fraud detection
+
+```bash
+python scripts/poc_e2e_test.py --models qwen llama
+```
+
+## Important Notes
+
+### seq_len Consistency
+The `seq_len` parameter must match between generation and validation. Default is 256 (in `PoCConfig`). Mismatched seq_len causes completely different distances.
+
+### r_target Calibration  
+The theoretical R formula (`estimate_R_from_experiment`) assumes random unit vectors. Model outputs have structure, so r_target must be empirically calibrated per model.

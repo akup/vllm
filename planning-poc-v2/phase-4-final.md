@@ -117,7 +117,33 @@ VLLM_USE_V1=0 python scripts/poc_smoke_test.py
   [PASS] Stats tracking works
   [PASS] collective_rpc execution works
 ALL CHECKS PASSED!
+
+# E2E tests with real server
+python scripts/poc_e2e_test.py --models qwen llama
+  [PASS] Qwen/Qwen3-0.6B - Generation, Validation, Fraud Detection
+  [PASS] unsloth/Llama-3.2-1B-Instruct - Generation, Validation, Fraud Detection
+ALL TESTS PASSED!
 ```
+
+## Key Fixes Applied
+
+1. **Per-app callback state**: Replaced global `_callback_url` with per-app storage in `_poc_tasks` dict
+2. **Removed dead code**: Removed unused `validate` action from engine.py (was using old tuple unpacking)
+3. **Progress logging**: Added time-based logging (5s interval) with PoW-style format
+4. **vLLM logger**: Use `init_logger(__name__)` for consistent log format
+5. **r_target in responses**: Added to status and callback batches for debugging
+6. **seq_len consistency**: Must match between generation and validation (default: 256)
+
+## r_target Calibration
+
+**Important**: The theoretical `estimate_R_from_experiment(n=vocab_size, P)` formula assumes random unit vectors, but model outputs have structure that compresses distances:
+
+| Model | Theoretical R | Actual Distances | Calibrated r_target |
+|-------|--------------|------------------|---------------------|
+| Qwen | ~1.41 | 1.14-1.16 | ~1.145 (empirical) |
+| Llama | ~1.41 | 1.34-1.38 | ~1.35 (empirical) |
+
+r_target must be empirically calibrated per model based on actual distance distributions.
 
 ## Usage
 

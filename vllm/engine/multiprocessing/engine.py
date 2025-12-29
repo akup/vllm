@@ -425,16 +425,6 @@ class MQLLMEngine:
             # Optimized version that returns batch + state in single call
             return manager.run_batch_with_state()
 
-        elif action == "validate":
-            nonces = payload.get("nonces", [])
-            public_key = payload.get("public_key", "")
-            distances, valid = manager.validate(nonces, public_key)
-            return {
-                "nonces": nonces,
-                "distances": distances,
-                "valid": valid,
-            }
-
         elif action == "queue_validation":
             # Validate nonces and return results for callback
             nonces = payload.get("nonces", [])

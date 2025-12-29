@@ -6,11 +6,16 @@ Run: python scripts/poc_callback_receiver.py --port 8081
 """
 import argparse
 import json
+import sys
 from datetime import datetime
 from typing import List
 
 from fastapi import FastAPI, Request
 import uvicorn
+
+# Force unbuffered output for logging
+def log(msg: str):
+    print(msg, flush=True)
 
 app = FastAPI(title="PoC Callback Receiver")
 
@@ -25,7 +30,11 @@ stats = {
 
 @app.post("/generated")
 async def receive_generated(request: Request) -> dict:
-    """Receive a generated batch from vLLM PoC (matching original API)."""
+    """Receive a generated batch from vLLM PoC.
+    
+    Note: This batch already contains only VALID nonces (filtered by sub_batch).
+    We receive nonces that passed r_target threshold on the server.
+    """
     body = await request.json()
     
     timestamp = datetime.now().isoformat()
@@ -39,21 +48,21 @@ async def receive_generated(request: Request) -> dict:
     
     nonces = body.get("nonces", [])
     distances = body.get("dist", [])
-    r_target = body.get("r_target", 1.0)
     
+    # All nonces in this batch are valid (already filtered by server)
     stats["total_nonces"] += len(nonces)
-    
-    valid_count = sum(1 for d in distances if d < r_target)
-    stats["total_valid"] += valid_count
+    stats["total_valid"] += len(nonces)
     
     # Log the batch
-    print(f"[{timestamp}] Received batch:")
-    print(f"  Block: {body.get('block_hash', 'N/A')[:16]}...")
-    print(f"  Nonces: {len(nonces)} | Valid: {valid_count}")
+    r_target = body.get('r_target', 'N/A')
+    log(f"[{timestamp}] Received {len(nonces)} valid nonces:")
+    log(f"  Block: {body.get('block_hash', 'N/A')[:16]}...")
+    log(f"  Public key: {body.get('public_key', 'N/A')}")
+    log(f"  r_target: {r_target}")
     if distances:
-        print(f"  Distance range: [{min(distances):.4f}, {max(distances):.4f}]")
-    print(f"  Stats: {stats['total_valid']}/{stats['total_nonces']} valid so far")
-    print()
+        log(f"  Distance range: [{min(distances):.4f}, {max(distances):.4f}]")
+    log(f"  Total valid so far: {stats['total_valid']}")
+    log("")
     
     return {"status": "OK", "received": len(nonces)}
 
@@ -65,11 +74,12 @@ async def receive_validated(request: Request) -> dict:
     
     timestamp = datetime.now().isoformat()
     
-    print(f"[{timestamp}] Received VALIDATED batch:")
-    print(f"  Block: {body.get('block_hash', 'N/A')[:16]}...")
-    print(f"  Nonces: {len(body.get('nonces', []))}")
-    print(f"  Fraud detected: {body.get('fraud_detected', 'N/A')}")
-    print()
+    log(f"[{timestamp}] Received VALIDATED batch:")
+    log(f"  Block: {body.get('block_hash', 'N/A')[:16]}...")
+    log(f"  Public key: {body.get('public_key', 'N/A')}")
+    log(f"  Nonces: {len(body.get('nonces', []))}")
+    log(f"  Fraud detected: {body.get('fraud_detected', 'N/A')}")
+    log("")
     
     return {"status": "OK"}
 
@@ -116,11 +126,11 @@ def main():
                         help="Port to listen on")
     args = parser.parse_args()
     
-    print(f"Starting PoC Callback Receiver on {args.host}:{args.port}")
-    print(f"Callback URL: http://localhost:{args.port}")
-    print(f"  POST /generated - receive generated batches")
-    print(f"  POST /validated - receive validated batches")
-    print()
+    log(f"Starting PoC Callback Receiver on {args.host}:{args.port}")
+    log(f"Callback URL: http://localhost:{args.port}")
+    log(f"  POST /generated - receive generated batches")
+    log(f"  POST /validated - receive validated batches")
+    log("")
     
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 

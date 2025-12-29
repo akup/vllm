@@ -158,8 +158,8 @@ class TestPoCPhase:
     def test_switch_to_generate(self, client, mock_engine_client):
         """Test switching to generate phase."""
         mock_engine_client.poc_request.side_effect = [
-            # First call: status check (needs to be initialized)
-            {"state": PoCState.VALIDATING.value},
+            # First call: status check (needs to be initialized, must include r_target)
+            {"state": PoCState.VALIDATING.value, "r_target": 1.5},
             # Second call: start_generate
             {"status": "generating", "pow_status": {"state": PoCState.GENERATING.value}},
         ]

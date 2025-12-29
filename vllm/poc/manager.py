@@ -24,6 +24,16 @@ class PoCStats:
     @property
     def rate(self) -> float:
         return self.total_checked / self.elapsed if self.elapsed > 0 else 0.0
+    
+    def report(self) -> str:
+        """Generate progress report matching original PoW format."""
+        success_rate = self.total_checked / self.total_valid if self.total_valid > 0 else 0
+        elapsed_min = self.elapsed / 60
+        valid_rate = self.total_valid / elapsed_min if elapsed_min > 0 else 0
+        raw_rate = self.total_checked / elapsed_min if elapsed_min > 0 else 0
+        return (f"Generated: {self.total_valid} / {self.total_checked} "
+                f"(1 in {success_rate:.0f}) Time: {elapsed_min:.2f}min "
+                f"({valid_rate:.2f} valid/min, {raw_rate:.2f} raw/min)")
 
 
 class PoCManager:
@@ -241,4 +251,5 @@ class PoCManager:
             "total_valid": self.stats.total_valid,
             "elapsed_seconds": self.stats.elapsed,
             "rate_per_second": self.stats.rate,
+            "r_target": self.config.r_target if self.config else None,
         }

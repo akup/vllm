@@ -96,6 +96,9 @@ def main():
     print(f"   Elapsed: {manager.stats.elapsed:.3f}s")
     print(f"   Rate: {manager.stats.rate:.1f} nonces/s")
     
+    # Capture generation stats before validation (validation also updates stats)
+    generation_checked = manager.stats.total_checked
+    
     # Validate nonces
     print("\n[5/5] Validating nonces (via collective_rpc)...")
     manager.start_validate()
@@ -104,10 +107,9 @@ def main():
     nonces_to_validate = all_nonces[:4]
     original_distances = all_distances[:4]
     
-    recomputed_distances, valid_flags = manager.validate(
-        nonces_to_validate, 
-        config.public_key
-    )
+    result = manager.validate(nonces_to_validate, config.public_key)
+    recomputed_distances = result["computed_distances"]
+    valid_flags = result["valid"]
     
     print(f"   Nonces: {nonces_to_validate}")
     print(f"   Original distances:   {[f'{d:.6f}' for d in original_distances]}")
@@ -124,7 +126,8 @@ def main():
     
     # Test different public key produces different distances
     print("\n   Testing different public key...")
-    other_distances, _ = manager.validate(nonces_to_validate, "different_pubkey")
+    other_result = manager.validate(nonces_to_validate, "different_pubkey")
+    other_distances = other_result["computed_distances"]
     distances_differ = original_distances != other_distances
     print(f"   Different public key -> different distances: {distances_differ}")
     
@@ -137,7 +140,7 @@ def main():
         ("Distances in valid range [0, 2]", all(0 <= d <= 2 for d in all_distances)),
         ("Deterministic (recompute matches)", all_match),
         ("Different pubkey -> different distances", distances_differ),
-        ("Stats tracking works", manager.stats.total_checked == num_batches * config.batch_size),
+        ("Stats tracking works", generation_checked == num_batches * config.batch_size),
         ("collective_rpc execution works", len(all_nonces) == num_batches * config.batch_size),
     ]
     

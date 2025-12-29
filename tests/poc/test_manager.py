@@ -475,14 +475,14 @@ class TestPoCManagerValidate:
         manager.init_round(config)
         manager.start_validate()
         
-        distances, valid = manager.validate([0, 1, 2], "test_node")
+        result = manager.validate([0, 1, 2], "test_node")
         
         # Verify collective_rpc was called
         mock_executor.collective_rpc.assert_called_once()
         
-        # Verify results
-        assert distances == [0.1, 0.6, 0.2]
-        assert valid == [True, False, True]
+        # Verify results (validate returns dict with computed_distances and valid)
+        assert result["computed_distances"] == [0.1, 0.6, 0.2]
+        assert result["valid"] == [True, False, True]
     
     def test_validate_requires_config(self, manager):
         """validate raises error if no round configured."""
