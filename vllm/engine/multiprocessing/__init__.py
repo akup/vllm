@@ -126,14 +126,31 @@ class RPCAdapterLoadedResponse:
     request_id: str
 
 
+# PoC (Proof of Compute) RPC types
+@dataclass
+class RPCPoCRequest:
+    """Generic PoC request - single type for all PoC operations."""
+    action: str  # "init", "start_generate", "start_validate", "stop", "status", "validate"
+    payload: dict  # Action-specific data
+    request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+
+
+@dataclass
+class RPCPoCResponse:
+    """Response from PoC operations."""
+    request_id: str
+    success: bool
+    result: dict
+
+
 RPC_REQUEST_T = Union[RPCProcessRequest, RPCAbortRequest, RPCStartupRequest,
                       RPCUProfileRequest, RPCLoadAdapterRequest,
                       RPCResetMultiModalCacheRequest,
                       RPCResetPrefixCacheRequest, RPCSleepRequest,
-                      RPCWakeUpRequest, RPCIsSleepingRequest]
+                      RPCWakeUpRequest, RPCIsSleepingRequest, RPCPoCRequest]
 
 REQUEST_OUTPUTS_T = Union[List[RequestOutput], RPCAdapterLoadedResponse,
-                          RPCIsSleepingResponse, RPCError]
+                          RPCIsSleepingResponse, RPCPoCResponse, RPCError]
 
 
 def ENGINE_DEAD_ERROR(

@@ -30,6 +30,7 @@ from vllm.engine.multiprocessing import (ENGINE_DEAD_ERROR, IPC_DATA_EXT,
                                          RPCIsSleepingRequest,
                                          RPCIsSleepingResponse,
                                          RPCLoadAdapterRequest,
+                                         RPCPoCRequest, RPCPoCResponse,
                                          RPCProcessRequest,
                                          RPCResetMultiModalCacheRequest,
                                          RPCResetPrefixCacheRequest,
@@ -251,7 +252,8 @@ class MQLLMEngineClient(EngineClient):
                 # Put each output into the appropriate queue.
                 elif isinstance(
                         request_outputs,
-                    (RPCAdapterLoadedResponse, RPCIsSleepingResponse)):
+                    (RPCAdapterLoadedResponse, RPCIsSleepingResponse,
+                     RPCPoCResponse)):
                     self._add_output(request_outputs)
                 else:
                     for request_output in request_outputs:
@@ -262,7 +264,8 @@ class MQLLMEngineClient(EngineClient):
 
     def _add_output(self, request_output: Union[RequestOutput,
                                                 RPCAdapterLoadedResponse,
-                                                RPCIsSleepingResponse]):
+                                                RPCIsSleepingResponse,
+                                                RPCPoCResponse]):
         queue = self.output_queues.get(request_output.request_id)
         if queue is not None:
             queue.put_nowait(request_output)
@@ -679,3 +682,37 @@ class MQLLMEngineClient(EngineClient):
         # Raise on error, otherwise happily return None
         if isinstance(request_output, BaseException):
             raise request_output
+
+    async def poc_request(self, action: str, payload: dict) -> dict:
+        """Send a PoC (Proof of Compute) request to the engine.
+        
+        Args:
+            action: The PoC action to perform ("init", "start_generate",
+                   "start_validate", "stop", "status", "run_batch", "validate")
+            payload: Action-specific data
+            
+        Returns:
+            Result dictionary from the engine
+        """
+        request = RPCPoCRequest(action=action, payload=payload)
+
+        # Create output queue for this request
+        queue: asyncio.Queue[Union[RPCPoCResponse,
+                                   BaseException]] = asyncio.Queue()
+        self.output_queues[request.request_id] = queue
+
+        # Send the request
+        request_bytes = pickle.dumps(request)
+        await self.input_socket.send_multipart((request_bytes, ), copy=False)
+
+        # Wait for the response
+        request_output = await queue.get()
+        self.output_queues.pop(request.request_id)
+
+        if isinstance(request_output, BaseException):
+            raise request_output
+
+        if not request_output.success:
+            raise RuntimeError(request_output.result.get("error", "Unknown error"))
+
+        return request_output.result

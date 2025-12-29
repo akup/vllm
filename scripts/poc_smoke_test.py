@@ -7,8 +7,8 @@ Usage:
 
 This script:
 1. Loads Qwen3-0.6B model using vLLM v0
-2. Creates a PoCManager
-3. Runs a few batches
+2. Creates a PoCManager with model_executor (TP/PP aware)
+3. Runs a few batches via collective_rpc
 4. Validates nonces
 5. Reports results
 """
@@ -26,7 +26,7 @@ from vllm.poc.config import PoCConfig
 
 def main():
     print("=" * 60)
-    print("PoC Manager Smoke Test")
+    print("PoC Manager Smoke Test (collective_rpc mode)")
     print("=" * 60)
     
     # Load model
@@ -38,21 +38,20 @@ def main():
         max_model_len=256,
     )
     
-    # Access model, config, and vllm_config (v0 API)
-    # TODO: Update for v1 compatibility - model access path differs in v1 engine
-    model = llm.llm_engine.model_executor.driver_worker.model_runner.model
+    # Access model_executor, config, and vllm_config (v0 API)
+    model_executor = llm.llm_engine.model_executor
     model_config = llm.llm_engine.model_config
     vllm_config = llm.llm_engine.vllm_config
     
     print(f"   Model: {model_config.model}")
     print(f"   Vocab size: {model_config.get_vocab_size()}")
     print(f"   Hidden size: {model_config.get_hidden_size()}")
+    print(f"   Executor type: {type(model_executor).__name__}")
     
-    # Create manager
+    # Create manager with model_executor (handles TP/PP via collective_rpc)
     print("\n[2/5] Creating PoCManager...")
-    manager = PoCManager(model, model_config, vllm_config)
+    manager = PoCManager(model_executor, model_config, vllm_config)
     print(f"   Device: {manager.device}")
-    print(f"   Dtype: {manager.dtype}")
     print(f"   State: {manager.state.value}")
     
     # Initialize round
@@ -72,11 +71,9 @@ def main():
     print(f"   r_target: {config.r_target}")
     print(f"   Batch size: {config.batch_size}")
     print(f"   Seq len: {config.seq_len}")
-    print(f"   Target shape: {manager.target.shape}")
-    print(f"   Target norm: {manager.target.norm().item():.6f}")
     
     # Run batches
-    print("\n[4/5] Running batches...")
+    print("\n[4/5] Running batches (via collective_rpc)...")
     manager.start_generate()
     
     num_batches = 3
@@ -100,7 +97,7 @@ def main():
     print(f"   Rate: {manager.stats.rate:.1f} nonces/s")
     
     # Validate nonces
-    print("\n[5/5] Validating nonces...")
+    print("\n[5/5] Validating nonces (via collective_rpc)...")
     manager.start_validate()
     
     # Pick first few nonces to validate
@@ -141,6 +138,7 @@ def main():
         ("Deterministic (recompute matches)", all_match),
         ("Different pubkey -> different distances", distances_differ),
         ("Stats tracking works", manager.stats.total_checked == num_batches * config.batch_size),
+        ("collective_rpc execution works", len(all_nonces) == num_batches * config.batch_size),
     ]
     
     all_passed = True
@@ -163,4 +161,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

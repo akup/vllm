@@ -22,6 +22,7 @@ from vllm.engine.multiprocessing import (ENGINE_DEAD_ERROR, IPC_DATA_EXT,
                                          RPCIsSleepingRequest,
                                          RPCIsSleepingResponse,
                                          RPCLoadAdapterRequest,
+                                         RPCPoCRequest, RPCPoCResponse,
                                          RPCProcessRequest,
                                          RPCResetMultiModalCacheRequest,
                                          RPCResetPrefixCacheRequest,
@@ -284,6 +285,8 @@ class MQLLMEngine:
                     self.wake_up(request.tags)
                 elif isinstance(request, RPCIsSleepingRequest):
                     self._handle_is_sleeping_request(request)
+                elif isinstance(request, RPCPoCRequest):
+                    self._handle_poc_request(request)
                 else:
                     raise ValueError("Unknown RPCRequest Type: "
                                      f"{type(request)}")
@@ -355,6 +358,81 @@ class MQLLMEngine:
         self._send_outputs(
             RPCIsSleepingResponse(request_id=request.request_id,
                                   is_sleeping=is_sleeping))
+
+    def _handle_poc_request(self, request: RPCPoCRequest):
+        """Handle PoC (Proof of Compute) requests."""
+        try:
+            result = self._process_poc_action(request.action, request.payload)
+            self._send_outputs(
+                RPCPoCResponse(
+                    request_id=request.request_id,
+                    success=True,
+                    result=result,
+                ))
+        except Exception as e:
+            self._send_outputs(
+                RPCPoCResponse(
+                    request_id=request.request_id,
+                    success=False,
+                    result={"error": str(e)},
+                ))
+
+    def _get_poc_manager(self):
+        """Get or create PoCManager instance."""
+        if not hasattr(self, '_poc_manager'):
+            from vllm.poc.manager import PoCManager
+            self._poc_manager = PoCManager(
+                model_executor=self.engine.model_executor,
+                model_config=self.engine.model_config,
+                vllm_config=self.engine.vllm_config,
+            )
+        return self._poc_manager
+
+    def _process_poc_action(self, action: str, payload: dict) -> dict:
+        """Process a PoC action and return result."""
+        manager = self._get_poc_manager()
+
+        if action == "init":
+            from vllm.poc.config import PoCConfig
+            config = PoCConfig(**payload)
+            manager.init_round(config)
+            return {"status": "initialized", "pow_status": manager.get_status()}
+
+        elif action == "start_generate":
+            manager.start_generate()
+            return {"status": "generating", "pow_status": manager.get_status()}
+
+        elif action == "start_validate":
+            manager.start_validate()
+            return {"status": "validating", "pow_status": manager.get_status()}
+
+        elif action == "stop":
+            manager.stop_round()
+            return {"status": "stopped", "pow_status": manager.get_status()}
+
+        elif action == "status":
+            return manager.get_status()
+
+        elif action == "run_batch":
+            batch = manager.run_batch()
+            return {
+                "nonces": batch.nonces,
+                "distances": batch.dist,
+                "pow_status": manager.get_status(),
+            }
+
+        elif action == "validate":
+            nonces = payload.get("nonces", [])
+            public_key = payload.get("public_key", "")
+            distances, valid = manager.validate(nonces, public_key)
+            return {
+                "nonces": nonces,
+                "distances": distances,
+                "valid": valid,
+            }
+
+        else:
+            raise ValueError(f"Unknown PoC action: {action}")
 
     def _health_check(self):
         # Send unhealthy if engine has already errored

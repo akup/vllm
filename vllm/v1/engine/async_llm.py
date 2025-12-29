@@ -540,6 +540,17 @@ class AsyncLLM(EngineClient):
         return await self.engine_core.collective_rpc_async(
             method, timeout, args, kwargs)
 
+    async def poc_request(self, action: str, payload: dict) -> dict:
+        """Send a PoC (Proof of Compute) request to the engine.
+        
+        Note: V1 PoC support is not yet implemented.
+        This method exists to satisfy the EngineClient protocol.
+        """
+        raise NotImplementedError(
+            "PoC is not yet supported in V1 engine. "
+            "Please use V0 engine (set VLLM_USE_V1=0)."
+        )
+
     @property
     def is_running(self) -> bool:
         # Is None before the loop is started.

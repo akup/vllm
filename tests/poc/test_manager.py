@@ -8,13 +8,27 @@ from vllm.poc.manager import PoCManager, PoCStats
 
 
 class MockModelConfig:
-    """Mock vLLM model config (v0 API)"""
+    """Mock vLLM model config"""
     
     def get_hidden_size(self):
         return 128
     
     def get_vocab_size(self):
         return 1000
+
+
+def create_mock_model_executor():
+    """Create a mock model executor with driver_worker.
+    
+    Returns a mock executor that has:
+    - driver_worker.device: torch.device
+    - collective_rpc: Mock that can be configured
+    """
+    executor = MagicMock()
+    executor.driver_worker = MagicMock()
+    executor.driver_worker.device = torch.device("cpu")
+    executor.collective_rpc = MagicMock(return_value=[None])
+    return executor
 
 
 def create_mock_vllm_config():
@@ -51,43 +65,36 @@ class TestPoCStats:
 
 class TestPoCManagerInit:
     @pytest.fixture
-    def mock_model(self):
-        model = Mock()
-        param = torch.zeros(1)
-        model.parameters.side_effect = lambda: iter([param])
-        return model
+    def mock_executor(self):
+        return create_mock_model_executor()
     
     @pytest.fixture
     def mock_vllm_config(self):
         return create_mock_vllm_config()
     
     @pytest.fixture
-    def manager(self, mock_model, mock_vllm_config):
-        return PoCManager(mock_model, MockModelConfig(), mock_vllm_config)
+    def manager(self, mock_executor, mock_vllm_config):
+        return PoCManager(mock_executor, MockModelConfig(), mock_vllm_config)
     
     def test_initial_state(self, manager):
         assert manager.state == PoCState.IDLE
         assert manager.config is None
-        assert manager.target is None
         assert manager.valid_nonces == []
         assert manager.valid_distances == []
 
 
 class TestPoCManagerStateTransitions:
     @pytest.fixture
-    def mock_model(self):
-        model = Mock()
-        param = torch.zeros(1, device="cpu")
-        model.parameters.side_effect = lambda: iter([param])
-        return model
+    def mock_executor(self):
+        return create_mock_model_executor()
     
     @pytest.fixture
     def mock_vllm_config(self):
         return create_mock_vllm_config()
     
     @pytest.fixture
-    def manager(self, mock_model, mock_vllm_config):
-        return PoCManager(mock_model, MockModelConfig(), mock_vllm_config)
+    def manager(self, mock_executor, mock_vllm_config):
+        return PoCManager(mock_executor, MockModelConfig(), mock_vllm_config)
     
     @pytest.fixture
     def config(self):
@@ -99,34 +106,26 @@ class TestPoCManagerStateTransitions:
         )
     
     def test_init_round_sets_config(self, manager, config):
-        with patch('vllm.poc.manager.generate_target') as mock_target:
-            mock_target.return_value = torch.randn(1000)
-            manager.init_round(config)
+        manager.init_round(config)
         
         assert manager.state == PoCState.IDLE
         assert manager.config == config
     
     def test_start_generate_sets_state(self, manager, config):
-        with patch('vllm.poc.manager.generate_target') as mock_target:
-            mock_target.return_value = torch.randn(1000)
-            manager.init_round(config)
+        manager.init_round(config)
         
         manager.start_generate()
         assert manager.state == PoCState.GENERATING
     
     def test_start_validate_sets_state(self, manager, config):
-        with patch('vllm.poc.manager.generate_target') as mock_target:
-            mock_target.return_value = torch.randn(1000)
-            manager.init_round(config)
+        manager.init_round(config)
         
         manager.start_validate()
         assert manager.state == PoCState.VALIDATING
     
     def test_generating_to_validating_transition(self, manager, config):
         """Test GENERATING -> VALIDATING transition."""
-        with patch('vllm.poc.manager.generate_target') as mock_target:
-            mock_target.return_value = torch.randn(1000)
-            manager.init_round(config)
+        manager.init_round(config)
         
         manager.start_generate()
         assert manager.state == PoCState.GENERATING
@@ -139,19 +138,15 @@ class TestPoCManagerStateTransitions:
         manager.valid_distances = [0.1, 0.2, 0.3]
         manager.stats.total_checked = 100
         
-        with patch('vllm.poc.manager.generate_target') as mock_target:
-            mock_target.return_value = torch.randn(1000)
-            manager.init_round(config)
+        manager.init_round(config)
         
         assert manager.valid_nonces == []
         assert manager.valid_distances == []
         assert manager.stats.total_checked == 0
     
     def test_init_round_raises_if_already_generating(self, manager, config):
-        with patch('vllm.poc.manager.generate_target') as mock_target:
-            mock_target.return_value = torch.randn(1000)
-            manager.init_round(config)
-            manager.start_generate()
+        manager.init_round(config)
+        manager.start_generate()
         
         with pytest.raises(RuntimeError, match="Round already in progress"):
             manager.init_round(config)
@@ -165,19 +160,15 @@ class TestPoCManagerStateTransitions:
             manager.start_validate()
     
     def test_stop_round_from_generating(self, manager, config):
-        with patch('vllm.poc.manager.generate_target') as mock_target:
-            mock_target.return_value = torch.randn(1000)
-            manager.init_round(config)
-            manager.start_generate()
+        manager.init_round(config)
+        manager.start_generate()
         
         manager.stop_round()
         assert manager.state == PoCState.STOPPED
     
     def test_stop_round_from_validating(self, manager, config):
-        with patch('vllm.poc.manager.generate_target') as mock_target:
-            mock_target.return_value = torch.randn(1000)
-            manager.init_round(config)
-            manager.start_validate()
+        manager.init_round(config)
+        manager.start_validate()
         
         manager.stop_round()
         assert manager.state == PoCState.STOPPED
@@ -187,19 +178,16 @@ class TestPoCManagerNonceGeneration:
     """Cross-check: Nonce iteration pattern with original NonceIterator"""
     
     @pytest.fixture
-    def mock_model(self):
-        model = Mock()
-        param = torch.zeros(1, device="cpu")
-        model.parameters.side_effect = lambda: iter([param])
-        return model
+    def mock_executor(self):
+        return create_mock_model_executor()
     
     @pytest.fixture
     def mock_vllm_config(self):
         return create_mock_vllm_config()
     
     @pytest.fixture
-    def manager(self, mock_model, mock_vllm_config):
-        return PoCManager(mock_model, MockModelConfig(), mock_vllm_config)
+    def manager(self, mock_executor, mock_vllm_config):
+        return PoCManager(mock_executor, MockModelConfig(), mock_vllm_config)
     
     def test_single_node_nonces(self, manager):
         """Single node gets sequential nonces: 0, 1, 2, ..."""
@@ -212,10 +200,8 @@ class TestPoCManagerNonceGeneration:
             node_count=1,
             batch_size=4,
         )
-        with patch('vllm.poc.manager.generate_target') as mock_target:
-            mock_target.return_value = torch.randn(1000)
-            manager.init_round(config)
-            manager.start_generate()
+        manager.init_round(config)
+        manager.start_generate()
         
         nonces1 = manager.get_next_nonces()
         assert nonces1 == [0, 1, 2, 3]
@@ -234,10 +220,8 @@ class TestPoCManagerNonceGeneration:
             node_count=3,
             batch_size=4,
         )
-        with patch('vllm.poc.manager.generate_target') as mock_target:
-            mock_target.return_value = torch.randn(1000)
-            manager.init_round(config)
-            manager.start_generate()
+        manager.init_round(config)
+        manager.start_generate()
         
         nonces = manager.get_next_nonces()
         assert nonces == [0, 3, 6, 9]
@@ -253,10 +237,8 @@ class TestPoCManagerNonceGeneration:
             node_count=3,
             batch_size=4,
         )
-        with patch('vllm.poc.manager.generate_target') as mock_target:
-            mock_target.return_value = torch.randn(1000)
-            manager.init_round(config)
-            manager.start_generate()
+        manager.init_round(config)
+        manager.start_generate()
         
         nonces = manager.get_next_nonces()
         assert nonces == [1, 4, 7, 10]
@@ -272,10 +254,8 @@ class TestPoCManagerNonceGeneration:
             node_count=3,
             batch_size=4,
         )
-        with patch('vllm.poc.manager.generate_target') as mock_target:
-            mock_target.return_value = torch.randn(1000)
-            manager.init_round(config)
-            manager.start_generate()
+        manager.init_round(config)
+        manager.start_generate()
         
         nonces = manager.get_next_nonces()
         assert nonces == [2, 5, 8, 11]
@@ -283,19 +263,16 @@ class TestPoCManagerNonceGeneration:
 
 class TestPoCManagerStatus:
     @pytest.fixture
-    def mock_model(self):
-        model = Mock()
-        param = torch.zeros(1, device="cpu")
-        model.parameters.side_effect = lambda: iter([param])
-        return model
+    def mock_executor(self):
+        return create_mock_model_executor()
     
     @pytest.fixture
     def mock_vllm_config(self):
         return create_mock_vllm_config()
     
     @pytest.fixture
-    def manager(self, mock_model, mock_vllm_config):
-        return PoCManager(mock_model, MockModelConfig(), mock_vllm_config)
+    def manager(self, mock_executor, mock_vllm_config):
+        return PoCManager(mock_executor, MockModelConfig(), mock_vllm_config)
     
     def test_get_status_idle(self, manager):
         status = manager.get_status()
@@ -318,57 +295,34 @@ class TestPoCManagerStatus:
         assert status["total_valid"] == 3
 
 
-# GPU Tests - require CUDA and load actual model
-# TODO: Update for vLLM v1 - model access path differs in v1 engine
-# TODO: These tests are skipped because running the model outside the worker
-#       context causes parallel group initialization errors. Proper GPU tests
-#       should be done in Phase 5 E2E tests where the full vLLM server runs.
-@pytest.mark.gpu
-@pytest.mark.skip(reason="GPU tests require full worker context - deferred to Phase 5 E2E tests")
-class TestPoCManagerGPU:
-    """GPU tests that load a real model to test run_batch and validate.
+class TestPoCManagerBatch:
+    """Test run_batch with mocked collective_rpc."""
     
-    Note: Currently uses vLLM v0 API for model access.
-    TODO: Update model access pattern for vLLM v1 compatibility.
+    @pytest.fixture
+    def mock_executor(self):
+        executor = create_mock_model_executor()
+        # Configure collective_rpc to return a result from "last PP rank"
+        executor.collective_rpc.return_value = [
+            None,  # First PP rank
+            {  # Last PP rank
+                "nonces": [0, 1, 2, 3],
+                "distances": [0.1, 0.2, 0.3, 0.4],
+            }
+        ]
+        return executor
     
-    WARNING: These tests are currently skipped because:
-    - The model needs to run inside the vLLM worker process context
-    - Extracting the model and running it directly causes parallel group errors
-    - Proper testing should be done in Phase 5 with full E2E integration tests
-    """
+    @pytest.fixture
+    def mock_vllm_config(self):
+        return create_mock_vllm_config()
     
-    @pytest.fixture(scope="class")
-    def model_and_config(self):
-        """Load Qwen3-0.6B model for testing (v0 API)."""
-        import os
-        from vllm import LLM
-        
-        # Force v0 engine
-        os.environ["VLLM_USE_V1"] = "0"
-        
-        llm = LLM(
-            model="Qwen/Qwen3-0.6B",
-            enforce_eager=True,
-            gpu_memory_utilization=0.3,
-            max_model_len=1024,
-        )
-        # v0 API: access model via model_executor.driver_worker.model_runner.model
-        # TODO: For v1, use worker.get_model() or collective_rpc pattern
-        model = llm.llm_engine.model_executor.driver_worker.model_runner.model
-        model_config = llm.llm_engine.model_config
-        vllm_config = llm.llm_engine.vllm_config
-        
-        yield model, model_config, vllm_config
-        
-        del llm
+    @pytest.fixture
+    def manager(self, mock_executor, mock_vllm_config):
+        return PoCManager(mock_executor, MockModelConfig(), mock_vllm_config)
     
-    def test_run_batch_produces_valid_distances(self, model_and_config):
-        """run_batch produces ProofBatch with distances in [0, 2]."""
-        model, model_config, vllm_config = model_and_config
-        manager = PoCManager(model, model_config, vllm_config)
-        
+    def test_run_batch_calls_collective_rpc(self, manager, mock_executor):
+        """run_batch should call collective_rpc with poc_forward_batch."""
         config = PoCConfig(
-            block_hash="test_block_hash",
+            block_hash="test_hash",
             block_height=100,
             public_key="test_node",
             r_target=0.5,
@@ -380,101 +334,20 @@ class TestPoCManagerGPU:
         
         batch = manager.run_batch()
         
-        assert len(batch) == 4
-        assert all(0 <= d <= 2 for d in batch.dist)
-        assert batch.block_hash == "test_block_hash"
-        assert batch.public_key == "test_node"
+        # Verify collective_rpc was called
+        mock_executor.collective_rpc.assert_called_once()
+        
+        # Verify batch data
+        assert batch.nonces == [0, 1, 2, 3]
+        assert batch.dist == [0.1, 0.2, 0.3, 0.4]
     
-    def test_run_batch_determinism(self, model_and_config):
-        """Same inputs produce same outputs."""
-        model, model_config, vllm_config = model_and_config
-        
-        manager1 = PoCManager(model, model_config, vllm_config)
-        config1 = PoCConfig(
-            block_hash="determinism_test",
-            block_height=100,
-            public_key="test_node",
-            r_target=0.5,
-            batch_size=4,
-            seq_len=32,
-        )
-        manager1.init_round(config1)
-        manager1.start_generate()
-        batch1 = manager1.run_batch()
-        
-        manager2 = PoCManager(model, model_config, vllm_config)
-        config2 = PoCConfig(
-            block_hash="determinism_test",
-            block_height=100,
-            public_key="test_node",
-            r_target=0.5,
-            batch_size=4,
-            seq_len=32,
-        )
-        manager2.init_round(config2)
-        manager2.start_generate()
-        batch2 = manager2.run_batch()
-        
-        assert batch1.nonces == batch2.nonces
-        for d1, d2 in zip(batch1.dist, batch2.dist):
-            assert abs(d1 - d2) < 1e-5
-    
-    def test_validate_recomputes_same_distances(self, model_and_config):
-        """validate() recomputes same distances for same nonces."""
-        model, model_config, vllm_config = model_and_config
-        manager = PoCManager(model, model_config, vllm_config)
-        
+    def test_run_batch_updates_stats(self, manager, mock_executor):
+        """run_batch should update stats."""
         config = PoCConfig(
-            block_hash="validate_test",
+            block_hash="test_hash",
             block_height=100,
             public_key="test_node",
             r_target=0.5,
-            batch_size=4,
-            seq_len=32,
-        )
-        manager.init_round(config)
-        manager.start_generate()
-        
-        batch = manager.run_batch()
-        
-        manager.start_validate()
-        distances, valid = manager.validate(batch.nonces, batch.public_key)
-        
-        for orig, recomputed in zip(batch.dist, distances):
-            assert abs(orig - recomputed) < 1e-5
-    
-    def test_different_public_key_different_distances(self, model_and_config):
-        """Different public_key produces different distances."""
-        model, model_config, vllm_config = model_and_config
-        manager = PoCManager(model, model_config, vllm_config)
-        
-        config = PoCConfig(
-            block_hash="pubkey_test",
-            block_height=100,
-            public_key="node1",
-            r_target=0.5,
-            batch_size=4,
-            seq_len=32,
-        )
-        manager.init_round(config)
-        manager.start_generate()
-        batch = manager.run_batch()
-        
-        manager.start_validate()
-        distances_other, _ = manager.validate(batch.nonces, "node2")
-        
-        assert batch.dist != distances_other
-    
-    def test_stats_updated_after_batch(self, model_and_config):
-        """Stats are updated after run_batch."""
-        model, model_config, vllm_config = model_and_config
-        manager = PoCManager(model, model_config, vllm_config)
-        
-        config = PoCConfig(
-            block_hash="stats_test",
-            block_height=100,
-            public_key="test_node",
-            r_target=2.0,
             batch_size=4,
             seq_len=32,
         )
@@ -486,4 +359,106 @@ class TestPoCManagerGPU:
         manager.run_batch()
         
         assert manager.stats.total_checked == 4
+    
+    def test_run_batch_tracks_valid_nonces(self, manager, mock_executor):
+        """run_batch should track valid nonces (d < r_target)."""
+        # Set r_target so some are valid
+        config = PoCConfig(
+            block_hash="test_hash",
+            block_height=100,
+            public_key="test_node",
+            r_target=0.25,  # First two will be valid (0.1, 0.2)
+            batch_size=4,
+            seq_len=32,
+        )
+        manager.init_round(config)
+        manager.start_generate()
+        
+        manager.run_batch()
+        
+        assert manager.valid_nonces == [0, 1]
+        assert manager.valid_distances == [0.1, 0.2]
+        assert manager.stats.total_valid == 2
+    
+    def test_run_batch_returns_empty_when_not_generating(self, manager):
+        """run_batch returns empty batch if not in GENERATING state."""
+        config = PoCConfig(
+            block_hash="test_hash",
+            block_height=100,
+            public_key="test_node",
+            r_target=0.5,
+        )
+        manager.init_round(config)
+        # Don't call start_generate()
+        
+        batch = manager.run_batch()
+        
+        assert len(batch) == 0
 
+
+class TestPoCManagerValidate:
+    """Test validate with mocked collective_rpc."""
+    
+    @pytest.fixture
+    def mock_executor(self):
+        executor = create_mock_model_executor()
+        return executor
+    
+    @pytest.fixture
+    def mock_vllm_config(self):
+        return create_mock_vllm_config()
+    
+    @pytest.fixture
+    def manager(self, mock_executor, mock_vllm_config):
+        return PoCManager(mock_executor, MockModelConfig(), mock_vllm_config)
+    
+    def test_validate_calls_collective_rpc(self, manager, mock_executor):
+        """validate should call collective_rpc with poc_validate_batch."""
+        mock_executor.collective_rpc.return_value = [
+            None,
+            {
+                "nonces": [0, 1, 2],
+                "distances": [0.1, 0.6, 0.2],
+                "valid": [True, False, True],
+            }
+        ]
+        
+        config = PoCConfig(
+            block_hash="test_hash",
+            block_height=100,
+            public_key="test_node",
+            r_target=0.5,
+        )
+        manager.init_round(config)
+        manager.start_validate()
+        
+        distances, valid = manager.validate([0, 1, 2], "test_node")
+        
+        # Verify collective_rpc was called
+        mock_executor.collective_rpc.assert_called_once()
+        
+        # Verify results
+        assert distances == [0.1, 0.6, 0.2]
+        assert valid == [True, False, True]
+    
+    def test_validate_requires_config(self, manager):
+        """validate raises error if no round configured."""
+        with pytest.raises(RuntimeError, match="No round configured"):
+            manager.validate([0, 1, 2], "test_node")
+
+
+# GPU Tests - require CUDA and load actual model
+# These tests are skipped because running the model outside the worker
+# context causes parallel group initialization errors. Proper GPU tests
+# should be done in Phase 5 E2E tests where the full vLLM server runs.
+@pytest.mark.gpu
+@pytest.mark.skip(reason="GPU tests require full worker context - deferred to Phase 5 E2E tests")
+class TestPoCManagerGPU:
+    """GPU tests that load a real model to test run_batch and validate.
+    
+    WARNING: These tests are currently skipped because:
+    - The model needs to run inside the vLLM worker process context
+    - Extracting the model and running it directly causes parallel group errors
+    - Proper testing should be done in Phase 5 with full E2E integration tests
+    """
+    pass
