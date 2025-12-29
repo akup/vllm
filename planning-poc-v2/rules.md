@@ -54,7 +54,7 @@ Key files to reference (not limited to them during cross check):
 - `service/routes.py` - API endpoints
 - `service/manager.py` - PowManager, state management
 
-Note: Logic may differ where explicitly discussed (e.g., RNG implementation uses torch.Generator instead of numpy SeedSequence). Use original as reference, not as exact specification.
+Note: Logic may differ where explicitly discussed (e.g., RNG implementation uses murmur3 instead of numpy SeedSequence for cross-device portability). Use original as reference, not as exact specification.
 
 ## Phase Completion
 
