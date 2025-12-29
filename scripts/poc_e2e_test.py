@@ -46,14 +46,12 @@ MODELS = {
 }
 
 # Model-specific r_target for ~10% valid rate
-# NOTE: Theoretical R estimation (from random unit vectors) gives ~1.41 for large vocab,
-# but model outputs are NOT random - they have structure that compresses distances.
-# These values are empirically calibrated from actual distance distributions:
-#   - Qwen: actual distances ~1.14-1.16 (very compressed)
-#   - Llama: actual distances ~1.34-1.38 (less compressed)
+# Empirically calibrated from distribution experiments (logs/experiment_report.md):
+#   - Qwen: mean=1.2155, p10=1.1739 (14% compressed vs theoretical 1.4142)
+#   - Llama: mean=1.4486, p10=1.3796 (close to theoretical)
 MODEL_R_TARGETS = {
-    "qwen": 1.145,   # 10th percentile of 1.14-1.16
-    "llama": 1.35,   # 10th percentile of 1.34-1.38
+    "qwen": 1.174,   # Empirical 10th percentile
+    "llama": 1.380,  # Empirical 10th percentile
 }
 
 # Test configuration (r_target overridden per model)

@@ -64,40 +64,44 @@ def estimate_R(n, P, num_samples=100000):
     return sorted_distances[index]
 ```
 
-### Reference Values
+### Theoretical vs Empirical Values
 
-For high-dimensional spaces, distances cluster around √2 ≈ 1.414.
+Theoretical formula assumes uniform distribution on sphere (random weights). **Trained models have structure** that compresses distances. Always use empirical values.
 
-| Model | Hidden Size | r_target (10% valid) | r_target (50% valid) |
-|-------|-------------|---------------------|---------------------|
-| Qwen/Qwen3-0.6B | 1024 | ~1.385 | ~1.414 |
-| unsloth/Llama-3.2-1B-Instruct | 2048 | ~1.392 | ~1.414 |
-| Llama-3.2-3B | 3072 | ~1.398 | ~1.414 |
+| Model | Theoretical (10%) | Empirical (10%) | Mean Distance |
+|-------|------------------|-----------------|---------------|
+| Qwen/Qwen3-0.6B | 1.4119 | **1.1739** | 1.2155 |
+| Llama-3.2-1B-Instruct | 1.4116 | **1.3796** | 1.4486 |
+| Random weights | 1.4119 | 1.4117 | 1.4138 |
 
-**Note**: These are theoretical estimates. Actual distances depend on:
-- Model architecture
-- Sequence length
-- Random input generation method
+### Empirical Calibration (Use These)
 
-### Quick Reference
-
+**Qwen/Qwen3-0.6B** (highly compressed distribution):
 ```
-P=0.50 (50% valid): r_target ≈ 1.414 (median)
-P=0.30 (30% valid): r_target ≈ 1.403
-P=0.20 (20% valid): r_target ≈ 1.396  
-P=0.10 (10% valid): r_target ≈ 1.385
-P=0.05 (5% valid):  r_target ≈ 1.378
-P=0.01 (1% valid):  r_target ≈ 1.362
+ 5% valid: r_target = 1.166
+10% valid: r_target = 1.174
+20% valid: r_target = 1.184
+30% valid: r_target = 1.193
+50% valid: r_target = 1.209
 ```
 
-### Model-Specific Observations
+**Llama-3.2-1B-Instruct** (close to theoretical):
+```
+ 5% valid: r_target = 1.363
+10% valid: r_target = 1.380
+20% valid: r_target = 1.406
+30% valid: r_target = 1.423
+50% valid: r_target = 1.451
+```
 
-Empirical testing shows different models produce different distance distributions:
+### Key Insight: Model Structure
 
-- **Qwen/Qwen3-0.6B**: Distances ~1.15-1.30, needs lower r_target (~1.20) for 10% valid
-- **unsloth/Llama-3.2-1B-Instruct**: Distances closer to theoretical, r_target=1.38 gives ~11% valid
+Experiments confirmed (see `logs/experiment_report.md`):
+- Random Qwen (same architecture, random weights): mean = 1.4138 (matches theory)
+- Trained Qwen: mean = 1.2155 (14% lower than theory)
+- Trained Llama: mean = 1.4486 (close to theory)
 
-Always calibrate r_target empirically for production use.
+This proves trained weights create structure that compresses Qwen's output distribution.
 
 ## Server Logs
 
