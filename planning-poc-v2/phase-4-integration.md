@@ -206,9 +206,9 @@ vllm/
 │   ├── data.py
 │   ├── gpu_random.py
 │   ├── manager.py      # Uses collective_rpc
-│   ├── worker_ops.py   # NEW - Worker operations for TP/PP
-│   ├── routes.py       # NEW - FastAPI router
-│   └── sender.py
+│   ├── worker_ops.py   # Worker operations for TP/PP
+│   ├── routes.py       # FastAPI router (includes callback logic)
+│   └── layer_hooks.py  # Layer transformations
 ├── engine/
 │   ├── multiprocessing/
 │   │   ├── __init__.py  # RPCPoCRequest/Response

@@ -334,8 +334,12 @@ class TestPoCManagerBatch:
         
         batch = manager.run_batch()
         
-        # Verify collective_rpc was called
-        mock_executor.collective_rpc.assert_called_once()
+        # Verify collective_rpc was called (once for layer hooks, once for forward batch)
+        assert mock_executor.collective_rpc.call_count == 2
+        # Last call should be the forward batch
+        from vllm.poc.worker_ops import poc_forward_batch
+        last_call = mock_executor.collective_rpc.call_args_list[-1]
+        assert last_call[0][0] == poc_forward_batch
         
         # Verify batch data
         assert batch.nonces == [0, 1, 2, 3]
@@ -477,8 +481,12 @@ class TestPoCManagerValidate:
         
         result = manager.validate([0, 1, 2], "test_node")
         
-        # Verify collective_rpc was called
-        mock_executor.collective_rpc.assert_called_once()
+        # Verify collective_rpc was called (once for layer hooks, once for validate batch)
+        assert mock_executor.collective_rpc.call_count == 2
+        # Last call should be the validate batch
+        from vllm.poc.worker_ops import poc_validate_batch
+        last_call = mock_executor.collective_rpc.call_args_list[-1]
+        assert last_call[0][0] == poc_validate_batch
         
         # Verify results (validate returns dict with computed_distances and valid)
         assert result["computed_distances"] == [0.1, 0.6, 0.2]

@@ -45,13 +45,11 @@ MODELS = {
     "llama": "unsloth/Llama-3.2-1B-Instruct",
 }
 
-# Model-specific r_target for ~10% valid rate
-# Empirically calibrated from distribution experiments (logs/experiment_report.md):
-#   - Qwen: mean=1.2155, p10=1.1739 (14% compressed vs theoretical 1.4142)
-#   - Llama: mean=1.4486, p10=1.3796 (close to theoretical)
+# r_target for ~10% valid rate (consistent across models with per-layer normalization)
+# Per phase 4.2: with per-layer normalization + random lm_head, both models use ~1.405
 MODEL_R_TARGETS = {
-    "qwen": 1.174,   # Empirical 10th percentile
-    "llama": 1.380,  # Empirical 10th percentile
+    "qwen": 1.405,
+    "llama": 1.405,
 }
 
 # Test configuration (r_target overridden per model)
@@ -59,7 +57,7 @@ TEST_CONFIG = {
     "block_hash": "e2e_test_block_hash_12345",
     "block_height": 100,
     "public_key": "e2e_test_node",
-    "r_target": 1.38,  # Default, overridden per model
+    "r_target": 1.405,  # Consistent across models with per-layer normalization
     "node_id": 0,
     "node_count": 1,
     "batch_size": 32,

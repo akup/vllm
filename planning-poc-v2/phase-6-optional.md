@@ -173,3 +173,60 @@ async def poc_blocking_middleware(request: Request, call_next):
 - [ ] Performance impact on validation documented
 - [ ] No race conditions or deadlocks
 
+---
+
+## 6.3 Callback Retry Queue
+
+Currently, if a callback to the receiver fails, the batch is silently dropped. This is acceptable for initial deployment but may cause valid nonces to be lost during temporary network issues.
+
+### Current Behavior
+
+```python
+except Exception as e:
+    logger.warning(f"Callback failed: {e}")  # Batch lost!
+```
+
+### Proposed Enhancement
+
+Add a bounded retry queue with exponential backoff:
+
+```python
+class CallbackSender:
+    def __init__(self, callback_url: str, max_retries: int = 3, max_queue_size: int = 100):
+        self.callback_url = callback_url
+        self.max_retries = max_retries
+        self.retry_queue: deque = deque(maxlen=max_queue_size)
+    
+    async def send(self, batch: dict) -> bool:
+        """Send batch, queue for retry on failure."""
+        try:
+            await self._post(batch)
+            return True
+        except Exception as e:
+            logger.warning(f"Callback failed: {e}, queuing for retry")
+            self.retry_queue.append((batch, 1))  # (batch, attempt_count)
+            return False
+    
+    async def retry_pending(self):
+        """Retry failed batches with exponential backoff."""
+        retried = []
+        while self.retry_queue:
+            batch, attempts = self.retry_queue.popleft()
+            try:
+                await self._post(batch)
+            except Exception:
+                if attempts < self.max_retries:
+                    retried.append((batch, attempts + 1))
+                else:
+                    logger.error(f"Batch dropped after {attempts} retries")
+        self.retry_queue.extend(retried)
+```
+
+### Acceptance Criteria for 6.3 (When Implemented)
+
+- [ ] Failed batches queued for retry
+- [ ] Exponential backoff between retries
+- [ ] Max retry count configurable
+- [ ] Bounded queue size (oldest dropped if full)
+- [ ] Retry stats exposed in /status endpoint
+- [ ] Tests for retry logic

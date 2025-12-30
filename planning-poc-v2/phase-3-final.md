@@ -10,8 +10,7 @@ vllm/poc/
 ├── config.py
 ├── data.py
 ├── gpu_random.py
-├── manager.py      <- NEW
-└── sender.py       <- NEW
+└── manager.py      <- NEW
 
 tests/poc/
 ├── __init__.py
@@ -40,10 +39,9 @@ Key methods:
 - `get_status()` - Returns current state and results
 - `_create_prefill_attn_metadata()` - Creates minimal attention metadata with PAD_SLOT_ID
 
-### vllm/poc/sender.py
+### Callback Sending
 
-- `PoCCallbackSender` - Sends valid batches to callback URL with retry logic
-- Failed batches stored and retried on subsequent calls; failures don't block generation
+Callback logic was simplified during Phase 4 integration and moved inline into `routes.py` - uses `aiohttp` directly in route handlers. No separate `sender.py` file.
 
 ### tests/poc/test_manager.py
 

@@ -3,11 +3,11 @@
 Applies transformations between transformer layers to break
 the model's learned output structure.
 """
-from typing import List, Optional
+from typing import List
 
 import torch
 
-from .gpu_random import generate_householder_vector, apply_householder, _seed_from_string, _uniform
+from .gpu_random import generate_householder_vector, apply_householder
 
 
 class LayerHouseholderHook:
@@ -121,109 +121,3 @@ class LayerHouseholderHook:
     def num_layers(self) -> int:
         """Number of layers with hooks attached."""
         return len(self.hooks)
-
-
-def _generate_signs(seed_str: str, dim: int, device: torch.device) -> torch.Tensor:
-    """Generate random ±1 signs for a layer."""
-    seed = _seed_from_string(seed_str)
-    u = _uniform(seed, dim, device)
-    return (u > 0.5).float() * 2 - 1  # Convert to ±1
-
-
-class LayerSignsHook:
-    """Per-round random signs applied between transformer layers.
-    
-    More disruptive than Householder because it independently flips
-    each dimension's sign, breaking correlations between dimensions.
-    
-    Usage:
-        # At round init
-        hooks = LayerSignsHook(model, block_hash, device, hidden_size)
-        
-        # Run forward passes...
-        
-        # At round end
-        hooks.detach()
-    """
-    
-    def __init__(
-        self,
-        model: torch.nn.Module,
-        block_hash: str,
-        device: torch.device,
-        hidden_size: int,
-    ):
-        self.hooks: List = []
-        self.sign_vectors: List[torch.Tensor] = []
-        self.block_hash = block_hash
-        self.call_counts: List[int] = []  # Debug: track hook calls
-        self._setup(model, block_hash, device, hidden_size)
-    
-    def _find_layers(self, model: torch.nn.Module) -> List[torch.nn.Module]:
-        """Find transformer layers in a model-agnostic way."""
-        if hasattr(model, 'model') and hasattr(model.model, 'layers'):
-            return list(model.model.layers)
-        elif hasattr(model, 'transformer') and hasattr(model.transformer, 'h'):
-            return list(model.transformer.h)
-        elif hasattr(model, 'layers'):
-            return list(model.layers)
-        return []
-    
-    def _setup(
-        self,
-        model: torch.nn.Module,
-        block_hash: str,
-        device: torch.device,
-        hidden_size: int,
-    ):
-        """Setup hooks on all transformer layers."""
-        layers = self._find_layers(model)
-        
-        for i in range(len(layers)):
-            seed_str = f"{block_hash}_layer_{i}_signs"
-            signs = _generate_signs(seed_str, hidden_size, device)
-            self.sign_vectors.append(signs)
-            
-            hook = layers[i].register_forward_hook(self._create_hook(i))
-            self.hooks.append(hook)
-    
-    def _create_hook(self, layer_idx: int):
-        """Create a forward hook that applies random sign flips.
-        
-        vLLM decoder layers typically return (hidden_states, residual).
-        We must transform BOTH to prevent residual connections from
-        preserving untransformed values.
-        """
-        def hook(module, input, output):
-            signs = self.sign_vectors[layer_idx]
-            
-            if isinstance(output, tuple):
-                if len(output) >= 2:
-                    hidden = output[0]
-                    residual = output[1]
-                    rest = output[2:] if len(output) > 2 else ()
-                    # Element-wise multiply by ±1 signs
-                    transformed_hidden = hidden * signs.to(hidden.dtype)
-                    transformed_residual = residual * signs.to(residual.dtype)
-                    return (transformed_hidden, transformed_residual) + rest
-                else:
-                    hidden = output[0]
-                    transformed = hidden * signs.to(hidden.dtype)
-                    return (transformed,)
-            else:
-                return output * signs.to(output.dtype)
-        
-        return hook
-    
-    def detach(self):
-        """Remove all hooks."""
-        for hook in self.hooks:
-            hook.remove()
-        self.hooks = []
-        self.sign_vectors = []
-    
-    @property
-    def num_layers(self) -> int:
-        """Number of layers with hooks attached."""
-        return len(self.hooks)
-

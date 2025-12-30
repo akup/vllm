@@ -117,70 +117,7 @@ Current implementation uses PAD_SLOT_ID which skips KV storage. For proper multi
 
 ## Implementation
 
-### File: `vllm/poc/sender.py`
-
-```python
-import asyncio
-import logging
-from typing import Optional, List
-from dataclasses import asdict
-
-import aiohttp
-
-from .data import ProofBatch, ValidatedBatch
-
-logger = logging.getLogger(__name__)
-
-
-class PoCCallbackSender:
-    """Sends valid batches to callback URL with retry logic.
-    
-    Failed batches are stored and retried on subsequent send calls.
-    Callback failures don't block generation.
-    """
-    
-    def __init__(self, callback_url: str, r_target: float, fraud_threshold: float):
-        self.callback_url = callback_url.rstrip("/")
-        self.r_target = r_target
-        self.fraud_threshold = fraud_threshold
-        self._session: Optional[aiohttp.ClientSession] = None
-    
-    async def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
-        return self._session
-    
-    async def _post(self, endpoint: str, data: dict) -> bool:
-        """POST data to callback URL. Returns True on success."""
-        url = f"{self.callback_url}{endpoint}"
-        try:
-            session = await self._get_session()
-            async with session.post(url, json=data, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    logger.debug(f"Callback sent to {url}")
-                    return True
-                else:
-                    logger.warning(f"Callback failed: {url} returned {resp.status}")
-                    return False
-        except Exception as e:
-            logger.warning(f"Callback error for {url}: {e}")
-            return False
-    
-    async def send_generated(self, batch: ProofBatch) -> None:
-        """POST {callback_url}/generated with valid nonces (filtered by r_target)."""
-        valid_batch = batch.sub_batch(self.r_target)
-        if len(valid_batch) > 0:
-            await self._post("/generated", asdict(valid_batch))
-    
-    async def send_validated(self, batch: ValidatedBatch) -> None:
-        """POST {callback_url}/validated with validation results."""
-        await self._post("/validated", asdict(batch))
-    
-    async def close(self) -> None:
-        """Close the HTTP session."""
-        if self._session and not self._session.closed:
-            await self._session.close()
-```
+**Note:** The callback sender logic was simplified and moved inline into `routes.py` during Phase 4 integration. The separate `sender.py` file was not created - callback sending uses `aiohttp` directly in the route handlers.
 
 ### File: `vllm/poc/manager.py`
 
@@ -270,8 +207,7 @@ vllm/poc/
 ├── config.py
 ├── data.py
 ├── gpu_random.py
-├── manager.py
-└── sender.py      # NEW: Callback sender for push model
+└── manager.py
 
 tests/poc/
 ├── __init__.py
