@@ -74,7 +74,7 @@ class PoCManager:
         """Initialize round with config. Does not start generating.
         
         Sets up per-round layer Householder hooks on all workers for
-        structure breaking.
+        structure breaking (unless use_layer_hooks=False for experiments).
         """
         if self.state == PoCState.GENERATING:
             raise RuntimeError("Round already in progress")
@@ -86,8 +86,9 @@ class PoCManager:
         self._nonce_counter = config.node_id
         self.state = PoCState.IDLE
         
-        # Setup per-round layer hooks on all workers
-        self._setup_layer_hooks()
+        # Setup per-round layer hooks on all workers (unless disabled for experiment)
+        if config.use_layer_hooks:
+            self._setup_layer_hooks()
     
     def _setup_layer_hooks(self) -> None:
         """Setup layer Householder hooks on all workers via collective_rpc."""
@@ -126,8 +127,8 @@ class PoCManager:
         """Stop current round and cleanup layer hooks."""
         self.state = PoCState.STOPPED
         
-        # Teardown layer hooks
-        if self.config is not None:
+        # Teardown layer hooks (only if they were enabled)
+        if self.config is not None and self.config.use_layer_hooks:
             self._teardown_layer_hooks()
     
     def get_next_nonces(self) -> List[int]:
@@ -163,6 +164,7 @@ class PoCManager:
                 self.model_config.get_hidden_size(),
                 self.config.r_target,
                 self.vllm_config,
+                self.config.use_sign_flips,
             ),
         )
         
@@ -239,6 +241,7 @@ class PoCManager:
                 self.model_config.get_hidden_size(),
                 self.config.r_target,
                 self.vllm_config,
+                self.config.use_sign_flips,
             ),
         )
         

@@ -18,6 +18,7 @@ from .gpu_random import (
     generate_nonce_transform_vectors,
     apply_householder,
     compute_distances_direct,
+    generate_sign_flips,
     _seed_from_string,
     _normal,
 )
@@ -185,22 +186,12 @@ def poc_forward_batch(
     hidden_size: int,
     r_target: float,
     vllm_config,
+    use_sign_flips: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Execute PoC forward pass following Worker.execute_model() patterns.
     
     Each worker generates identical inputs (deterministic RNG).
     PP coordination follows same pattern as Worker.execute_model().
-    
-    Args:
-        worker: Worker instance (injected by collective_rpc)
-        block_hash: Block hash for deterministic generation
-        public_key: Public key for deterministic generation
-        nonces: List of nonces to process
-        seq_len: Sequence length
-        vocab_size: Model vocabulary size
-        hidden_size: Model hidden size
-        r_target: Target distance threshold
-        vllm_config: VllmConfig for forward context
         
     Returns:
         Dict with nonces and distances on last PP rank, None on other ranks.
@@ -252,27 +243,27 @@ def poc_forward_batch(
     hidden_states = hidden_states.view(batch_size, seq_len, -1)
     last_hidden = hidden_states[:, -1, :].float()  # [batch, hidden_size]
     
-    # Per-nonce Householder transform on hidden states (structure breaking)
-    # This provides per-nonce randomization based on public_key
+    # Apply random sign flips if enabled (alternative to layer hooks)
+    if use_sign_flips:
+        signs = generate_sign_flips(block_hash, public_key, nonces, hidden_size, device)
+        last_hidden = last_hidden * signs
+    
+    # Per-nonce Householder transform
     transform_vectors = generate_nonce_transform_vectors(
         block_hash, public_key, nonces, hidden_size, device, num_reflections=8
     )
     for r in range(transform_vectors.shape[1]):
-        v = transform_vectors[:, r, :]  # [batch, hidden]
+        v = transform_vectors[:, r, :]
         last_hidden = apply_householder(last_hidden, v)
     
-    # EXPERIMENT: Normalize hidden states to unit sphere before projection
-    # This removes magnitude-based structure ("clumping") from the distribution
+    # Normalize to unit sphere
     last_hidden = last_hidden / last_hidden.norm(dim=-1, keepdim=True)
     
-    # Use RANDOM lm_head projection instead of trained lm_head
-    # This ensures consistent distribution across all block_hashes
-    # The random projection is seeded by block_hash for reproducibility
-    # Using POC_OUTPUT_DIM (8192) instead of vocab_size saves ~18x memory
+    # Random lm_head projection for consistent distribution
     random_lm_head = _generate_random_lm_head(block_hash, hidden_size, POC_OUTPUT_DIM, device)
-    logits = last_hidden @ random_lm_head.T  # [batch, POC_OUTPUT_DIM]
+    logits = last_hidden @ random_lm_head.T
     
-    # Generate target and compute distances (same dimension as output)
+    # Compute distances
     target = generate_target(block_hash, POC_OUTPUT_DIM, device)
     distances = compute_distances_direct(logits.float(), target)
     
@@ -293,18 +284,17 @@ def poc_validate_batch(
     hidden_size: int,
     r_target: float,
     vllm_config,
+    use_sign_flips: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Validate nonces by recomputing distances.
-    
-    Same as poc_forward_batch but for validation context.
-    Uses the provided public_key (which may differ from generator's key).
     
     Returns:
         Dict with nonces, distances, and valid flags on last PP rank.
     """
     result = poc_forward_batch(
         worker, block_hash, public_key, nonces,
-        seq_len, vocab_size, hidden_size, r_target, vllm_config
+        seq_len, vocab_size, hidden_size, r_target, vllm_config,
+        use_sign_flips
     )
     
     if result is None:

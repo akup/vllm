@@ -208,3 +208,39 @@ def compute_distances_direct(
     """
     logits_norm = logits / logits.norm(dim=1, keepdim=True)
     return (logits_norm - target.unsqueeze(0)).norm(dim=1)
+
+
+def generate_sign_flips(
+    block_hash: str,
+    public_key: str,
+    nonces: List[int],
+    dim: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Generate per-nonce random sign flips (+1 or -1) for each dimension.
+    
+    This breaks hidden state clustering by randomly flipping the sign of each
+    dimension, which decorrelates the directional structure while preserving
+    the magnitude structure after normalization.
+    
+    Args:
+        block_hash: Block hash for deterministic generation
+        public_key: Public key for deterministic generation
+        nonces: List of nonces
+        dim: Hidden dimension size
+        device: Target device
+        
+    Returns:
+        Tensor of shape [batch_size, dim] with values +1 or -1
+    """
+    batch_size = len(nonces)
+    signs = torch.empty(batch_size, dim, device=device, dtype=torch.float32)
+    
+    for i, nonce in enumerate(nonces):
+        seed_str = f"{block_hash}_{public_key}_nonce_{nonce}_signs"
+        seed = _seed_from_string(seed_str)
+        # Generate uniform values and threshold at 0.5 to get +1/-1
+        u = _uniform(seed, dim, device)
+        signs[i] = (u > 0.5).float() * 2 - 1  # Convert to +1/-1
+    
+    return signs

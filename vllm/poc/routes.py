@@ -28,6 +28,9 @@ class PoCInitRequest(BaseModel):
     batch_size: int = 32
     seq_len: int = 256
     callback_url: Optional[str] = None
+    # Experiment flags
+    use_layer_hooks: bool = True
+    use_sign_flips: bool = False
 
 
 class PoCStatusResponse(BaseModel):

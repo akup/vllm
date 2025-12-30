@@ -11,6 +11,8 @@ Usage:
     python scripts/poc_full_e2e_test.py --models qwen      # Only Qwen
     python scripts/poc_full_e2e_test.py --models llama     # Only Llama
     python scripts/poc_full_e2e_test.py --duration 60      # 60s per test
+    python scripts/poc_full_e2e_test.py --no-layer-hooks   # Disable layer hooks
+    python scripts/poc_full_e2e_test.py --sign-flips       # Enable sign flips transform
 
 Monitor progress:
     tail -f logs/e2e_results.jsonl
@@ -174,6 +176,8 @@ def run_single_test(
     public_key: str,
     test_duration: int,
     logs_dir: Path,
+    use_layer_hooks: bool = True,
+    use_sign_flips: bool = False,
 ) -> Dict[str, Any]:
     """Run a single isolated test. Returns result dict."""
     
@@ -199,6 +203,8 @@ def run_single_test(
         "error": None,
         "server_log": str(server_log),
         "callback_log": str(callback_log),
+        "use_layer_hooks": use_layer_hooks,
+        "use_sign_flips": use_sign_flips,
     }
     
     callback_proc = None
@@ -224,9 +230,13 @@ def run_single_test(
             "node_count": 1,
             "callback_url": f"http://localhost:{CALLBACK_PORT}",
             "seq_len": 256,
+            "use_layer_hooks": use_layer_hooks,
+            "use_sign_flips": use_sign_flips,
         }
         api_call("POST", "/api/v1/pow/init/generate", config)
-        print(f"    PoC generation started, running for {test_duration}s...")
+        hooks_str = "hooks=ON" if use_layer_hooks else "hooks=OFF"
+        signs_str = "+signs" if use_sign_flips else ""
+        print(f"    PoC generation started ({hooks_str}{signs_str}), running for {test_duration}s...")
         
         # 4. Wait for test duration
         time.sleep(test_duration)
@@ -275,6 +285,10 @@ def main():
                         help="Models to test (default: all)")
     parser.add_argument("--duration", type=int, default=TEST_DURATION,
                         help=f"Test duration in seconds (default: {TEST_DURATION})")
+    parser.add_argument("--no-layer-hooks", action="store_true",
+                        help="Disable per-layer normalization hooks")
+    parser.add_argument("--sign-flips", action="store_true",
+                        help="Enable random sign flips transform")
     args = parser.parse_args()
     
     # Filter models if specified
@@ -283,6 +297,8 @@ def main():
         models = [(m, s) for m, s in MODELS if s in args.models]
     
     test_duration = args.duration
+    use_layer_hooks = not args.no_layer_hooks
+    use_sign_flips = args.sign_flips
     
     print("=" * 70)
     print("Full E2E Distribution Test")
@@ -293,6 +309,8 @@ def main():
     print(f"r_target: {R_TARGET}")
     print(f"Duration per test: {test_duration}s")
     print(f"Total tests: {len(models) * len(BLOCK_HASHES) * len(PUBLIC_KEYS)}")
+    print(f"Layer hooks: {'ON' if use_layer_hooks else 'OFF'}")
+    print(f"Sign flips: {'ON' if use_sign_flips else 'OFF'}")
     print()
     
     # Setup logs directory
@@ -326,6 +344,8 @@ def main():
                     public_key=public_key,
                     test_duration=test_duration,
                     logs_dir=logs_dir,
+                    use_layer_hooks=use_layer_hooks,
+                    use_sign_flips=use_sign_flips,
                 )
                 
                 all_results.append(result)
