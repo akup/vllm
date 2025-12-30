@@ -165,6 +165,9 @@ class PoCManager:
                 self.config.r_target,
                 self.vllm_config,
                 self.config.use_sign_flips,
+                self.config.use_nonce_householder,
+                self.config.use_nonce_orthogonal,
+                self.config.pick_k_dims,
             ),
         )
         
@@ -242,6 +245,9 @@ class PoCManager:
                 self.config.r_target,
                 self.vllm_config,
                 self.config.use_sign_flips,
+                self.config.use_nonce_householder,
+                self.config.use_nonce_orthogonal,
+                self.config.pick_k_dims,
             ),
         )
         

@@ -31,6 +31,10 @@ class PoCInitRequest(BaseModel):
     # Experiment flags
     use_layer_hooks: bool = True
     use_sign_flips: bool = False
+    # Per-nonce transform flags (post-forward, last PP rank)
+    use_nonce_householder: bool = True
+    use_nonce_orthogonal: bool = False
+    pick_k_dims: Optional[int] = None
 
 
 class PoCStatusResponse(BaseModel):

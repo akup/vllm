@@ -18,6 +18,8 @@ Usage:
     python scripts/poc_e2e_test.py
     python scripts/poc_e2e_test.py --models qwen  # Only test Qwen
     python scripts/poc_e2e_test.py --models llama  # Only test Llama
+    python scripts/poc_e2e_test.py --run-name hh_k10 --pick-k-dims 10
+    python scripts/poc_e2e_test.py --run-name ortho_k10 --pick-k-dims 10 --use-nonce-orthogonal --no-use-nonce-householder
 """
 
 import argparse
@@ -90,6 +92,14 @@ def setup_logs_dir() -> Path:
     logs_dir = Path("logs")
     logs_dir.mkdir(exist_ok=True)
     return logs_dir
+
+
+def setup_run_logs_dir(run_name: str) -> Path:
+    """Create per-run logs directory under logs/."""
+    base = setup_logs_dir()
+    run_dir = base / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
 
 
 def start_callback_receiver(logs_dir: Path) -> subprocess.Popen:
@@ -207,7 +217,10 @@ def clear_callback_stats():
         pass
 
 
-def run_generation(callback_url: str, model_key: str) -> Dict[str, Any]:
+def run_generation(callback_url: str, model_key: str, *,
+                   use_nonce_householder: bool,
+                   use_nonce_orthogonal: bool,
+                   pick_k_dims: Optional[int]) -> Dict[str, Any]:
     """Run generation and return status with valid nonces."""
     # Clear callback stats before starting
     clear_callback_stats()
@@ -219,6 +232,9 @@ def run_generation(callback_url: str, model_key: str) -> Dict[str, Any]:
         **TEST_CONFIG,
         "r_target": r_target,
         "callback_url": callback_url,
+        "use_nonce_householder": use_nonce_householder,
+        "use_nonce_orthogonal": use_nonce_orthogonal,
+        "pick_k_dims": pick_k_dims,
     }
     
     # Start generation
@@ -244,9 +260,13 @@ def run_generation(callback_url: str, model_key: str) -> Dict[str, Any]:
     return status
 
 
-def validate_nonces(nonces: List[int], distances: List[float], 
+def validate_nonces(nonces: List[int], distances: List[float],
                     block_hash: str = None, public_key: str = None,
-                    r_target: float = None) -> Dict[str, Any]:
+                    r_target: float = None,
+                    *,
+                    use_nonce_householder: bool,
+                    use_nonce_orthogonal: bool,
+                    pick_k_dims: Optional[int]) -> Dict[str, Any]:
     """Validate nonces and return result."""
     if block_hash is None:
         block_hash = TEST_CONFIG["block_hash"]
@@ -261,6 +281,9 @@ def validate_nonces(nonces: List[int], distances: List[float],
         "block_height": TEST_CONFIG["block_height"],
         "public_key": public_key,
         "r_target": r_target,
+        "use_nonce_householder": use_nonce_householder,
+        "use_nonce_orthogonal": use_nonce_orthogonal,
+        "pick_k_dims": pick_k_dims,
     }
     api_call("POST", "/api/v1/pow/init/validate", init_config)
     
@@ -284,7 +307,11 @@ def validate_nonces(nonces: List[int], distances: List[float],
 
 
 def test_model(model_key: str, model_name: str, logs_dir: Path, 
-               callback_url: str) -> TestResult:
+               callback_url: str,
+               *,
+               use_nonce_householder: bool,
+               use_nonce_orthogonal: bool,
+               pick_k_dims: Optional[int]) -> TestResult:
     """Test a single model."""
     result = TestResult(model=model_name)
     start_time = time.time()
@@ -296,7 +323,13 @@ def test_model(model_key: str, model_name: str, logs_dir: Path,
         print(f"\n  Phase 1: Generation")
         server_proc = start_vllm_server(model_name, logs_dir, model_key)
         
-        status = run_generation(callback_url, model_key)
+        status = run_generation(
+            callback_url,
+            model_key,
+            use_nonce_householder=use_nonce_householder,
+            use_nonce_orthogonal=use_nonce_orthogonal,
+            pick_k_dims=pick_k_dims,
+        )
         result.generation_nonces = status["total_checked"]
         result.generation_valid = status["total_valid"]
         
@@ -320,7 +353,14 @@ def test_model(model_key: str, model_name: str, logs_dir: Path,
         # Note: Current API doesn't return computed distances, only fraud_detected
         # We'll test determinism by checking fraud_detected is False
         r_target = MODEL_R_TARGETS.get(model_key, TEST_CONFIG["r_target"])
-        val_result = validate_nonces(valid_nonces[:10], valid_distances[:10], r_target=r_target)
+        val_result = validate_nonces(
+            valid_nonces[:10],
+            valid_distances[:10],
+            r_target=r_target,
+            use_nonce_householder=use_nonce_householder,
+            use_nonce_orthogonal=use_nonce_orthogonal,
+            pick_k_dims=pick_k_dims,
+        )
         result.validation_match = not val_result.get("fraud_detected", True)
         
         # Debug: show distances comparison
@@ -351,6 +391,10 @@ def test_model(model_key: str, model_name: str, logs_dir: Path,
             valid_nonces[:5], fake_low_distances,
             block_hash="wrong_block_hash_xyz",
             r_target=0.1  # Strict: 0.05 < 0.1 (claimed valid), computed ~1.2 >= 0.1 (invalid)
+            ,
+            use_nonce_householder=use_nonce_householder,
+            use_nonce_orthogonal=use_nonce_orthogonal,
+            pick_k_dims=pick_k_dims,
         )
         # With wrong hash and strict r_target, fraud should be detected
         result.wrong_hash_different = wrong_hash_result.get("fraud_detected", False)
@@ -361,6 +405,10 @@ def test_model(model_key: str, model_name: str, logs_dir: Path,
             valid_nonces[:5], fake_low_distances,
             public_key="wrong_public_key_xyz",
             r_target=0.1
+            ,
+            use_nonce_householder=use_nonce_householder,
+            use_nonce_orthogonal=use_nonce_orthogonal,
+            pick_k_dims=pick_k_dims,
         )
         result.wrong_pubkey_different = wrong_pubkey_result.get("fraud_detected", False)
         print(f"  Wrong public_key -> fraud detected: {'PASS' if result.wrong_pubkey_different else 'FAIL'}")
@@ -388,14 +436,54 @@ def main():
     parser.add_argument("--models", nargs="+", choices=list(MODELS.keys()),
                         default=list(MODELS.keys()),
                         help="Models to test (default: all)")
+    parser.add_argument("--run-name", default=None,
+                        help="Name of this run (artifacts stored under logs/<run-name>/). "
+                             "Default: timestamp-based name.")
+    parser.add_argument("--pick-k-dims", type=int, default=None,
+                        help="pick_k_dims to send to PoC (default: None).")
+    parser.add_argument("--use-nonce-orthogonal", action="store_true",
+                        help="Enable per-nonce orthogonal transform mode.")
+    parser.add_argument("--no-use-nonce-householder", action="store_true",
+                        help="Disable per-nonce householder transform mode.")
     args = parser.parse_args()
     
     print("=" * 60)
     print("PoC E2E Test Suite")
     print("=" * 60)
     
-    logs_dir = setup_logs_dir()
+    if args.run_name is None:
+        args.run_name = datetime.now().strftime("e2e_%Y%m%d_%H%M%S")
+
+    logs_dir = setup_run_logs_dir(args.run_name)
     print(f"\nLogs directory: {logs_dir.absolute()}")
+
+    use_nonce_orthogonal = bool(args.use_nonce_orthogonal)
+    use_nonce_householder = not bool(args.no_use_nonce_householder)
+    pick_k_dims = args.pick_k_dims
+
+    if use_nonce_orthogonal and use_nonce_householder:
+        print("ERROR: Choose only one of householder vs orthogonal per-nonce transform.")
+        print("       Use --use-nonce-orthogonal with --no-use-nonce-householder.")
+        return 2
+
+    # Save run config for artifacts/debugging
+    run_config_file = logs_dir / "run_config.json"
+    with open(run_config_file, "w") as f:
+        json.dump(
+            {
+                "run_name": args.run_name,
+                "models": args.models,
+                "use_nonce_householder": use_nonce_householder,
+                "use_nonce_orthogonal": use_nonce_orthogonal,
+                "pick_k_dims": pick_k_dims,
+                "server_port": SERVER_PORT,
+                "callback_port": CALLBACK_PORT,
+                "test_config": TEST_CONFIG,
+                "model_r_targets": MODEL_R_TARGETS,
+            },
+            f,
+            indent=2,
+        )
     
     suite = TestSuite()
     callback_proc = None
@@ -413,7 +501,15 @@ def main():
             print(f"\n[{i+2}/{len(args.models)+2}] Testing {model_name}")
             print("-" * 50)
             
-            result = test_model(model_key, model_name, logs_dir, callback_url)
+            result = test_model(
+                model_key,
+                model_name,
+                logs_dir,
+                callback_url,
+                use_nonce_householder=use_nonce_householder,
+                use_nonce_orthogonal=use_nonce_orthogonal,
+                pick_k_dims=pick_k_dims,
+            )
             suite.results.append(result)
             
             status = "PASS" if result.passed else "FAIL"

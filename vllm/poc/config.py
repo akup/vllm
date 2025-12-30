@@ -25,4 +25,14 @@ class PoCConfig:
     # Randomization mode: sign flips recommended (simpler, better consistency)
     use_layer_hooks: bool = False  # Per-layer normalization + Householder (alternative)
     use_sign_flips: bool = True    # Per-nonce sign flips (recommended, <2% cross-block spread)
+    # Per-nonce transform on last hidden state (post-forward, last PP rank).
+    # Householder reflections were the original implementation.
+    use_nonce_householder: bool = True
+    # Alternative: apply a random orthogonal transform matrix per nonce
+    # (implemented as a seeded permutation+sign matrix for efficiency).
+    use_nonce_orthogonal: bool = False
+    # Optional: pick k dimensions per nonce (seeded) to operate in a k-D
+    # subspace. If None, no picking is performed.
+    # Used by some transform modes (e.g., nonce orthogonal transform).
+    pick_k_dims: Optional[int] = None
 

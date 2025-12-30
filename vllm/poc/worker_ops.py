@@ -19,6 +19,8 @@ from .gpu_random import (
     apply_householder,
     compute_distances_direct,
     generate_sign_flips,
+    random_pick_orthogonal_transform,
+    random_pick_indices,
     _seed_from_string,
     _normal,
 )
@@ -175,6 +177,39 @@ def _compute_logits(model, hidden_states: torch.Tensor) -> torch.Tensor:
         raise RuntimeError("Model does not have compute_logits or lm_head")
 
 
+def _normalize_distance_for_dim(
+    distances: torch.Tensor,
+    *,
+    k_dim: int,
+    ref_dim: int,
+) -> torch.Tensor:
+    """Normalize distances computed in k_dim so they're comparable to ref_dim.
+    
+    For unit vectors u,t:
+      d = ||u - t|| = sqrt(2 - 2c), where c = u·t.
+    For random directions in R^d, c has ~0 mean and variance ~1/d.
+    
+    We map c_k -> c_ref by scaling cosine similarity:
+      c_ref ≈ c_k * sqrt(k_dim / ref_dim)
+    and then invert back to distance.
+    
+    This keeps distances largely invariant to choosing a smaller k_dim.
+    """
+    if k_dim <= 0 or ref_dim <= 0:
+        raise ValueError(f"k_dim and ref_dim must be positive, got {k_dim}, {ref_dim}")
+    if k_dim == ref_dim:
+        return distances
+
+    # Convert distance -> cosine similarity.
+    # d^2 = 2 - 2c  =>  c = 1 - d^2/2
+    d2 = distances * distances
+    c = 1.0 - 0.5 * d2
+
+    scale = (float(k_dim) / float(ref_dim))**0.5
+    c_ref = torch.clamp(c * scale, -1.0, 1.0)
+    return torch.sqrt(torch.clamp(2.0 - 2.0 * c_ref, min=0.0))
+
+
 @torch.inference_mode()
 def poc_forward_batch(
     worker,  # Injected by collective_rpc
@@ -187,6 +222,9 @@ def poc_forward_batch(
     r_target: float,
     vllm_config,
     use_sign_flips: bool = False,
+    use_nonce_householder: bool = True,
+    use_nonce_orthogonal: bool = False,
+    pick_k_dims: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     """Execute PoC forward pass following Worker.execute_model() patterns.
     
@@ -251,13 +289,64 @@ def poc_forward_batch(
     # Normalize to unit sphere first (breaks magnitude structure)
     last_hidden = last_hidden / (last_hidden.norm(dim=-1, keepdim=True) + 1e-8)
     
-    # Per-nonce Householder transform (on unit sphere)
-    transform_vectors = generate_nonce_transform_vectors(
-        block_hash, public_key, nonces, hidden_size, device, num_reflections=8
-    )
-    for r in range(transform_vectors.shape[1]):
-        v = transform_vectors[:, r, :]
-        last_hidden = apply_householder(last_hidden, v)
+    if use_nonce_householder and use_nonce_orthogonal:
+        raise ValueError(
+            "Only one of use_nonce_householder and use_nonce_orthogonal can be enabled."
+        )
+
+    # Per-nonce transform (on unit sphere)
+    if use_nonce_householder:
+        # Householder reflections (original implementation)
+        transform_vectors = generate_nonce_transform_vectors(
+            block_hash, public_key, nonces, hidden_size, device, num_reflections=8
+        )
+        for r in range(transform_vectors.shape[1]):
+            v = transform_vectors[:, r, :]
+            last_hidden = apply_householder(last_hidden, v)
+    elif use_nonce_orthogonal:
+        # If pick_k_dims is set, do efficient k-D orthogonal mixing:
+        # pick k dims per nonce, rotate in k-D using Haar-random Q[k,k],
+        # and compare against matching target slice.
+        #
+        # If pick_k_dims is None, we do *no picking* and would need a full
+        # Haar orthogonal matrix in hidden_size dims, which is O(d^3).
+        # Guardrail: disallow this for large dims.
+        if pick_k_dims is None:
+            if hidden_size > 100:
+                raise AssertionError(
+                    "pick_k_dims is None with use_nonce_orthogonal=True would "
+                    f"require full Haar QR in dim={hidden_size} (too slow). "
+                    "Set pick_k_dims (e.g. 10) to enable the efficient mode."
+                )
+            # Full-dim Haar orthogonal for small dims (<=100): rotate full vector
+            # and compare to full target (same dimension).
+            from .gpu_random import generate_haar_orthogonal_matrices
+            target_hidden = generate_target(block_hash, hidden_size, device)
+            Q = generate_haar_orthogonal_matrices(
+                block_hash, public_key, nonces, hidden_size, device, dtype=last_hidden.dtype
+            )
+            y = torch.bmm(Q, last_hidden.unsqueeze(-1)).squeeze(-1)
+            # Both are unit vectors (target is unit; last_hidden normalized above).
+            distances = (y - target_hidden.unsqueeze(0)).norm(dim=-1)
+            distances = _normalize_distance_for_dim(
+                distances, k_dim=hidden_size, ref_dim=hidden_size
+            ).cpu().tolist()
+            return {"nonces": nonces, "distances": distances}
+
+        k = int(pick_k_dims)
+        if k <= 0 or k > hidden_size:
+            raise ValueError(f"pick_k_dims must be in [1, hidden_size], got {k}")
+        target_hidden = generate_target(block_hash, hidden_size, device)
+        yk, tk = random_pick_orthogonal_transform(
+            last_hidden, target_hidden, block_hash, public_key, nonces, k
+        )
+        yk = yk / (yk.norm(dim=-1, keepdim=True) + 1e-8)
+        tk = tk / (tk.norm(dim=-1, keepdim=True) + 1e-8)
+        distances = (yk - tk).norm(dim=-1)
+        distances = _normalize_distance_for_dim(
+            distances, k_dim=k, ref_dim=hidden_size
+        ).cpu().tolist()
+        return {"nonces": nonces, "distances": distances}
     
     # Random lm_head projection for consistent distribution
     random_lm_head = _generate_random_lm_head(block_hash, hidden_size, POC_OUTPUT_DIM, device)
@@ -265,7 +354,28 @@ def poc_forward_batch(
     
     # Compute distances
     target = generate_target(block_hash, POC_OUTPUT_DIM, device)
-    distances = compute_distances_direct(logits.float(), target)
+    if pick_k_dims is None:
+        distances = compute_distances_direct(logits.float(), target)
+    else:
+        k_logits = int(pick_k_dims)
+        if k_logits <= 0 or k_logits > POC_OUTPUT_DIM:
+            raise ValueError(
+                f"pick_k_dims must be in [1, {POC_OUTPUT_DIM}] for non-orthogonal mode, got {k_logits}"
+            )
+        # Per-nonce picked slice in logit space (seeded by nonce), compared to
+        # matching target slice. This keeps computation O(k) per nonce.
+        idx = random_pick_indices(
+            block_hash, public_key, nonces, POC_OUTPUT_DIM, k_logits, device
+        )
+        logits_k = torch.gather(logits.float(), 1, idx)
+        target_k = target.to(device=device, dtype=logits_k.dtype).unsqueeze(0).expand(batch_size, -1)
+        target_k = torch.gather(target_k, 1, idx)
+        logits_k = logits_k / (logits_k.norm(dim=-1, keepdim=True) + 1e-8)
+        target_k = target_k / (target_k.norm(dim=-1, keepdim=True) + 1e-8)
+        distances = (logits_k - target_k).norm(dim=-1)
+        distances = _normalize_distance_for_dim(
+            distances, k_dim=k_logits, ref_dim=POC_OUTPUT_DIM
+        )
     
     return {
         "nonces": nonces,
@@ -285,6 +395,9 @@ def poc_validate_batch(
     r_target: float,
     vllm_config,
     use_sign_flips: bool = False,
+    use_nonce_householder: bool = True,
+    use_nonce_orthogonal: bool = False,
+    pick_k_dims: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     """Validate nonces by recomputing distances.
     
@@ -294,7 +407,10 @@ def poc_validate_batch(
     result = poc_forward_batch(
         worker, block_hash, public_key, nonces,
         seq_len, vocab_size, hidden_size, r_target, vllm_config,
-        use_sign_flips
+        use_sign_flips,
+        use_nonce_householder,
+        use_nonce_orthogonal,
+        pick_k_dims,
     )
     
     if result is None:

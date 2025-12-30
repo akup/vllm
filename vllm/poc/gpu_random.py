@@ -244,3 +244,120 @@ def generate_sign_flips(
         signs[i] = (u > 0.5).float() * 2 - 1  # Convert to +1/-1
     
     return signs
+
+
+def random_pick_indices(
+    block_hash: str,
+    public_key: str,
+    nonces: List[int],
+    dim: int,
+    k: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Pick k dimensions per nonce deterministically (seed-based).
+    
+    We score each dimension index by a seeded hash and take the k smallest
+    scores. This yields a deterministic, per-nonce subset without replacement.
+    
+    Returns:
+        indices: int64 tensor of shape [batch_size, k]
+    """
+    if k <= 0 or k > dim:
+        raise ValueError(f"k must be in [1, dim], got k={k}, dim={dim}")
+
+    batch_size = len(nonces)
+    out = torch.empty(batch_size, k, device=device, dtype=torch.int64)
+    all_idx = torch.arange(dim, device=device, dtype=torch.int32)
+
+    for i, nonce in enumerate(nonces):
+        seed = _seed_from_string(
+            f"{block_hash}_{public_key}_nonce_{nonce}_pick_{k}"
+        )
+        scores = _murmur3_32(all_idx, seed)  # int64
+        # Take k smallest scores via topk on the negated values (O(dim log k)).
+        _, chosen = torch.topk(-scores, k=k, largest=True, sorted=False)
+        out[i] = chosen.to(torch.int64)
+
+    return out
+
+
+def generate_haar_orthogonal_matrices(
+    block_hash: str,
+    public_key: str,
+    nonces: List[int],
+    k: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Generate per-nonce Haar-random orthogonal matrices of shape [k, k].
+    
+    Uses seeded Gaussian -> QR -> sign-fix to get Haar distribution over O(k).
+    
+    Returns:
+        Q: Tensor of shape [batch_size, k, k]
+    """
+    if k <= 0:
+        raise ValueError(f"k must be positive, got k={k}")
+
+    Qs = []
+    for nonce in nonces:
+        seed = _seed_from_string(
+            f"{block_hash}_{public_key}_nonce_{nonce}_haar_qr_{k}"
+        )
+        A = _normal(seed, k * k, device).view(k, k).to(dtype)
+
+        Q, R = torch.linalg.qr(A, mode="reduced")
+
+        # Haar sign-fix: make diag(R) positive by scaling columns of Q.
+        diag = torch.diagonal(R, 0)
+        signs = torch.sign(diag)
+        signs = torch.where(signs == 0, torch.ones_like(signs), signs)
+        Q = Q * signs.unsqueeze(0)
+
+        Qs.append(Q)
+
+    return torch.stack(Qs, dim=0)
+
+
+def random_pick_orthogonal_transform(
+    x: torch.Tensor,
+    target_full: torch.Tensor,
+    block_hash: str,
+    public_key: str,
+    nonces: List[int],
+    k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Random-pick k dims per nonce, rotate by Haar-random Q[k,k], and slice target.
+    
+    Steps (per nonce):
+      1) Pick indices I (seeded by nonce) of length k
+      2) Build Haar-random orthogonal Q[k,k] (seeded by nonce)
+      3) y = Q @ x[I]
+      4) t = target_full[I]
+    
+    Args:
+        x: [batch, dim] float tensor
+        target_full: [dim] float tensor (seeded by block_hash elsewhere)
+        block_hash/public_key/nonces: seeds
+        k: picked dimension count
+    
+    Returns:
+        y: [batch, k]
+        t: [batch, k]
+    """
+    device = x.device
+    dim = x.shape[1]
+    indices = random_pick_indices(block_hash, public_key, nonces, dim, k, device)
+
+    # Gather picked sub-vectors and target slices.
+    xk = torch.gather(x, 1, indices)
+    tk = target_full.to(device=device, dtype=x.dtype).unsqueeze(0).expand(x.shape[0], -1)
+    tk = torch.gather(tk, 1, indices)
+
+    # Rotate with per-nonce Haar Q.
+    Q = generate_haar_orthogonal_matrices(
+        block_hash, public_key, nonces, k, device, dtype=x.dtype
+    )
+    y = torch.bmm(Q, xk.unsqueeze(-1)).squeeze(-1)
+
+    return y, tk

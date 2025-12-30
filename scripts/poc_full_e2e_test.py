@@ -2,7 +2,9 @@
 """
 Full E2E Distribution Test for PoC with vLLM Server.
 
-Runs 18 isolated tests (3 blocks x 3 public_keys x 2 models).
+Runs isolated tests across:
+- 3 blocks x 3 public_keys x 2 models
+- 2 fixed PoC configurations (see MODES below)
 Each test runs with completely fresh server + callback instances.
 All logs saved to separate files per experiment.
 
@@ -10,9 +12,7 @@ Usage:
     python scripts/poc_full_e2e_test.py
     python scripts/poc_full_e2e_test.py --models qwen      # Only Qwen
     python scripts/poc_full_e2e_test.py --models llama     # Only Llama
-    python scripts/poc_full_e2e_test.py --duration 60      # 60s per test
-    python scripts/poc_full_e2e_test.py --no-layer-hooks   # Disable layer hooks
-    python scripts/poc_full_e2e_test.py --sign-flips       # Enable sign flips transform
+    python scripts/poc_full_e2e_test.py --duration 120     # seconds per test
 
 Monitor progress:
     tail -f logs/e2e_results.jsonl
@@ -25,9 +25,10 @@ import os
 import subprocess
 import sys
 import time
+import signal
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, Set
 
 import requests
 
@@ -44,7 +45,33 @@ BLOCK_HASHES = ["block_alpha", "block_beta", "block_gamma"]
 PUBLIC_KEYS = ["node_A", "node_B", "node_C"]
 
 R_TARGET = 1.4160  # Above max p10 across block_hashes - expects 5-35% valid rate depending on block
-TEST_DURATION = 80  # seconds per test
+# Increase test duration 3x vs older 40s runs to reduce noise.
+TEST_DURATION = 120  # seconds per test
+
+# Always use the same k for all modes.
+PICK_K_DIMS = 10
+
+# Fixed mode sweep (do not expose layer-hooks/sign-flips sweeps via CLI).
+# 1) both hooks and flips, no orthogonal
+# 2) no hooks, no flip, only orthogonal
+MODES = [
+    {
+        "mode": "hooks+flips_no_ortho",
+        "use_layer_hooks": True,
+        "use_sign_flips": True,
+        "use_nonce_householder": True,
+        "use_nonce_orthogonal": False,
+        "pick_k_dims": PICK_K_DIMS,
+    },
+    {
+        "mode": "ortho_only_no_hooks_no_flips",
+        "use_layer_hooks": False,
+        "use_sign_flips": False,
+        "use_nonce_householder": False,
+        "use_nonce_orthogonal": True,
+        "pick_k_dims": PICK_K_DIMS,
+    },
+]
 
 CALLBACK_PORT = 8081
 SERVER_PORT = 8765
@@ -66,6 +93,7 @@ def start_callback_receiver(log_file: Path) -> subprocess.Popen:
         stdout=f,
         stderr=subprocess.STDOUT,
         cwd=Path.cwd(),
+        start_new_session=True,
     )
     proc._log_file = f
     
@@ -104,6 +132,7 @@ def start_vllm_server(model: str, log_file: Path) -> subprocess.Popen:
         stderr=subprocess.STDOUT,
         env=env,
         cwd=Path.cwd(),
+        start_new_session=True,
     )
     proc._log_file = f
     
@@ -129,11 +158,19 @@ def stop_process(proc: subprocess.Popen):
     if proc is None:
         return
     if proc.poll() is None:
-        proc.terminate()
+        # Kill the whole process group so child processes (e.g. engine workers)
+        # don't remain alive and keep ports bound.
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             proc.wait()
     if hasattr(proc, '_log_file') and proc._log_file:
         proc._log_file.flush()
@@ -176,12 +213,17 @@ def run_single_test(
     public_key: str,
     test_duration: int,
     logs_dir: Path,
-    use_layer_hooks: bool = True,
-    use_sign_flips: bool = False,
+    *,
+    mode: str,
+    use_layer_hooks: bool,
+    use_sign_flips: bool,
+    use_nonce_householder: bool,
+    use_nonce_orthogonal: bool,
+    pick_k_dims: int,
 ) -> Dict[str, Any]:
     """Run a single isolated test. Returns result dict."""
     
-    prefix = f"test_{test_num:02d}_{model_short}_{block_hash}_{public_key}"
+    prefix = f"test_{test_num:02d}_{mode}_{model_short}_{block_hash}_{public_key}"
     server_log = logs_dir / f"{prefix}_server.log"
     callback_log = logs_dir / f"{prefix}_callback.log"
     
@@ -205,6 +247,10 @@ def run_single_test(
         "callback_log": str(callback_log),
         "use_layer_hooks": use_layer_hooks,
         "use_sign_flips": use_sign_flips,
+        "use_nonce_householder": use_nonce_householder,
+        "use_nonce_orthogonal": use_nonce_orthogonal,
+        "pick_k_dims": pick_k_dims,
+        "mode": mode,
     }
     
     callback_proc = None
@@ -232,11 +278,16 @@ def run_single_test(
             "seq_len": 256,
             "use_layer_hooks": use_layer_hooks,
             "use_sign_flips": use_sign_flips,
+            "use_nonce_householder": use_nonce_householder,
+            "use_nonce_orthogonal": use_nonce_orthogonal,
+            "pick_k_dims": pick_k_dims,
         }
         api_call("POST", "/api/v1/pow/init/generate", config)
         hooks_str = "hooks=ON" if use_layer_hooks else "hooks=OFF"
         signs_str = "+signs" if use_sign_flips else ""
-        print(f"    PoC generation started ({hooks_str}{signs_str}), running for {test_duration}s...")
+        ortho_str = "+ortho" if use_nonce_orthogonal else ""
+        k_str = f"+k={pick_k_dims}" if pick_k_dims is not None else ""
+        print(f"    PoC generation started ({hooks_str}{signs_str}{ortho_str}{k_str}), running for {test_duration}s...")
         
         # 4. Wait for test duration
         time.sleep(test_duration)
@@ -285,10 +336,11 @@ def main():
                         help="Models to test (default: all)")
     parser.add_argument("--duration", type=int, default=TEST_DURATION,
                         help=f"Test duration in seconds (default: {TEST_DURATION})")
-    parser.add_argument("--no-layer-hooks", action="store_true",
-                        help="Disable per-layer normalization hooks")
-    parser.add_argument("--sign-flips", action="store_true",
-                        help="Enable random sign flips transform")
+    parser.add_argument("--results-file", type=str, default="logs/e2e_results.jsonl",
+                        help="Where to append JSONL results (default: logs/e2e_results.jsonl)")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from an existing results file by skipping already-completed "
+                             "(mode, model, block_hash, public_key) combinations.")
     args = parser.parse_args()
     
     # Filter models if specified
@@ -297,8 +349,6 @@ def main():
         models = [(m, s) for m, s in MODELS if s in args.models]
     
     test_duration = args.duration
-    use_layer_hooks = not args.no_layer_hooks
-    use_sign_flips = args.sign_flips
     
     print("=" * 70)
     print("Full E2E Distribution Test")
@@ -308,53 +358,103 @@ def main():
     print(f"Public keys: {PUBLIC_KEYS}")
     print(f"r_target: {R_TARGET}")
     print(f"Duration per test: {test_duration}s")
-    print(f"Total tests: {len(models) * len(BLOCK_HASHES) * len(PUBLIC_KEYS)}")
-    print(f"Layer hooks: {'ON' if use_layer_hooks else 'OFF'}")
-    print(f"Sign flips: {'ON' if use_sign_flips else 'OFF'}")
+    print(f"pick_k_dims: {PICK_K_DIMS}")
+    print(f"Modes: {[m['mode'] for m in MODES]}")
+    print(f"Total tests: {len(MODES) * len(models) * len(BLOCK_HASHES) * len(PUBLIC_KEYS)}")
     print()
     
     # Setup logs directory
     logs_dir = Path("logs")
     logs_dir.mkdir(exist_ok=True)
     
-    results_file = logs_dir / "e2e_results.jsonl"
+    results_file = Path(args.results_file)
+    results_file.parent.mkdir(parents=True, exist_ok=True)
     print(f"Results file: {results_file}")
     print(f"Monitor with: tail -f {results_file}")
     print()
+
+    def _test_key(d: Dict[str, Any]) -> Optional[Tuple[str, str, str, str]]:
+        """Stable key for resume: (mode, model, block_hash, public_key)."""
+        mode = d.get("mode")
+        model = d.get("model")
+        block_hash = d.get("block_hash")
+        public_key = d.get("public_key")
+        if not (mode and model and block_hash and public_key):
+            return None
+        return (mode, model, block_hash, public_key)
+
+    completed: Set[Tuple[str, str, str, str]] = set()
+    if args.resume and results_file.exists():
+        # Build set of completed tests from existing JSONL.
+        # We only treat rows with error==None as completed.
+        with open(results_file, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    # Ignore partial/corrupt lines.
+                    continue
+                key = _test_key(row)
+                if key is None:
+                    # Ignore older formats that don't include mode.
+                    continue
+                if row.get("error") is None:
+                    completed.add(key)
+        print(f"Resume enabled: found {len(completed)} completed tests in {results_file}")
+        print()
     
     # Run all tests
-    test_num = 0
+    # Build deterministic schedule so resume skips the right items and test ids
+    # remain stable within a given version of this script.
+    schedule = []
+    for mode_cfg in MODES:
+        for model_name, model_short in models:
+            for block_hash in BLOCK_HASHES:
+                for public_key in PUBLIC_KEYS:
+                    schedule.append((mode_cfg, model_name, model_short, block_hash, public_key))
+
+    total_tests = len(schedule)
     all_results = []
-    
-    for model_name, model_short in models:
-        for block_hash in BLOCK_HASHES:
-            for public_key in PUBLIC_KEYS:
-                test_num += 1
-                total_tests = len(models) * len(BLOCK_HASHES) * len(PUBLIC_KEYS)
-                
-                print("-" * 70)
-                print(f"Test {test_num}/{total_tests}: {model_short} | {block_hash} | {public_key}")
-                print("-" * 70)
-                
-                result = run_single_test(
-                    test_num=test_num,
-                    model_name=model_name,
-                    model_short=model_short,
-                    block_hash=block_hash,
-                    public_key=public_key,
-                    test_duration=test_duration,
-                    logs_dir=logs_dir,
-                    use_layer_hooks=use_layer_hooks,
-                    use_sign_flips=use_sign_flips,
-                )
-                
-                all_results.append(result)
-                
-                # Append to JSONL immediately (real-time tracking)
-                with open(results_file, "a") as f:
-                    f.write(json.dumps(result) + "\n")
-                
-                print()
+
+    for idx, (mode_cfg, model_name, model_short, block_hash, public_key) in enumerate(schedule, start=1):
+        key = (mode_cfg["mode"], model_short, block_hash, public_key)
+        if args.resume and key in completed:
+            print("-" * 70)
+            print(f"SKIP {idx}/{total_tests}: {mode_cfg['mode']} | {model_short} | {block_hash} | {public_key} (already completed)")
+            print("-" * 70)
+            print()
+            continue
+
+        print("-" * 70)
+        print(f"Test {idx}/{total_tests}: {mode_cfg['mode']} | {model_short} | {block_hash} | {public_key}")
+        print("-" * 70)
+
+        result = run_single_test(
+            test_num=idx,
+            model_name=model_name,
+            model_short=model_short,
+            block_hash=block_hash,
+            public_key=public_key,
+            test_duration=test_duration,
+            logs_dir=logs_dir,
+            mode=mode_cfg["mode"],
+            use_layer_hooks=mode_cfg["use_layer_hooks"],
+            use_sign_flips=mode_cfg["use_sign_flips"],
+            use_nonce_householder=mode_cfg["use_nonce_householder"],
+            use_nonce_orthogonal=mode_cfg["use_nonce_orthogonal"],
+            pick_k_dims=mode_cfg["pick_k_dims"],
+        )
+
+        all_results.append(result)
+
+        # Append to JSONL immediately (real-time tracking)
+        with open(results_file, "a") as f:
+            f.write(json.dumps(result) + "\n")
+
+        print()
     
     # Summary
     print("=" * 70)
