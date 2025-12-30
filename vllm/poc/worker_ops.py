@@ -14,10 +14,118 @@ from vllm.attention.backends.utils import PAD_SLOT_ID
 
 from .gpu_random import (
     generate_inputs,
-    generate_permutations,
     generate_target,
-    compute_distances,
+    generate_nonce_transform_vectors,
+    apply_householder,
+    compute_distances_direct,
+    _seed_from_string,
+    _normal,
 )
+from .layer_hooks import LayerHouseholderHook
+
+# Worker-level state for layer hooks (persists across RPC calls)
+_layer_hooks: Optional[LayerHouseholderHook] = None
+
+# Output dimension for PoC random projection (smaller = cheaper & more stable)
+# Using 8192 instead of full vocab_size (151936 for Qwen) saves ~18x memory
+POC_OUTPUT_DIM = 8192
+
+# Worker-level cache for random lm_head (regenerated per block_hash)
+_random_lm_head_cache: Dict[str, torch.Tensor] = {}
+
+
+def _generate_random_lm_head(
+    block_hash: str,
+    hidden_size: int,
+    output_dim: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Generate deterministic random projection matrix for block_hash.
+    
+    This replaces the trained lm_head to ensure consistent distribution
+    across all block_hashes. The random projection is seeded by block_hash
+    so validators can reproduce the same distances.
+    
+    Args:
+        block_hash: Block hash for deterministic seeding
+        hidden_size: Model hidden dimension
+        output_dim: Output dimension (use POC_OUTPUT_DIM, not vocab_size)
+        device: Target device
+        
+    Returns:
+        Random weight matrix of shape [output_dim, hidden_size]
+    """
+    global _random_lm_head_cache
+    
+    cache_key = f"{block_hash}_{hidden_size}_{output_dim}"
+    if cache_key in _random_lm_head_cache:
+        return _random_lm_head_cache[cache_key]
+    
+    seed = _seed_from_string(f"{block_hash}_lm_head")
+    # Generate random weight matrix using deterministic RNG
+    weight = _normal(seed, hidden_size * output_dim, device)
+    weight = weight.view(output_dim, hidden_size)
+    # Scale for numerical stability (similar to typical init)
+    weight = weight * 0.02
+    
+    # Cache for this block_hash (clear old entries to limit memory)
+    if len(_random_lm_head_cache) > 3:
+        _random_lm_head_cache.clear()
+    _random_lm_head_cache[cache_key] = weight
+    
+    return weight
+
+
+def poc_setup_layer_hooks(
+    worker,  # Injected by collective_rpc
+    block_hash: str,
+    hidden_size: int,
+) -> Dict[str, Any]:
+    """Setup per-round layer Householder hooks on the model.
+    
+    Called once at round init via collective_rpc.
+    Hooks persist across all batch calls until teardown.
+    
+    Uses Householder reflections at each layer for orthogonal
+    transformations that mix all dimensions.
+    """
+    global _layer_hooks
+    
+    # Teardown existing hooks if any
+    if _layer_hooks is not None:
+        _layer_hooks.detach()
+    
+    device = worker.device
+    model = worker.model_runner.model
+    
+    _layer_hooks = LayerHouseholderHook(model, block_hash, device, hidden_size)
+    
+    return {
+        "status": "ok",
+        "num_layers": _layer_hooks.num_layers,
+        "block_hash": block_hash,
+    }
+
+
+def poc_teardown_layer_hooks(
+    worker,  # Injected by collective_rpc
+) -> Dict[str, Any]:
+    """Remove layer hooks from the model.
+    
+    Called at round end via collective_rpc.
+    """
+    global _layer_hooks
+    
+    num_removed = 0
+    if _layer_hooks is not None:
+        num_removed = _layer_hooks.num_layers
+        _layer_hooks.detach()
+        _layer_hooks = None
+    
+    return {
+        "status": "ok",
+        "num_removed": num_removed,
+    }
 
 
 def _create_prefill_attn_metadata(
@@ -140,19 +248,33 @@ def poc_forward_batch(
             )
         return None  # Not last rank
     
-    # Last PP rank: compute logits and distances
+    # Last PP rank: apply per-nonce transform and compute distances
     hidden_states = hidden_states.view(batch_size, seq_len, -1)
-    last_hidden = hidden_states[:, -1, :]
+    last_hidden = hidden_states[:, -1, :].float()  # [batch, hidden_size]
     
-    logits = _compute_logits(model, last_hidden)
-    
-    # Generate permutations and target locally (deterministic)
-    permutations = generate_permutations(
-        block_hash, public_key, nonces, vocab_size, device
+    # Per-nonce Householder transform on hidden states (structure breaking)
+    # This provides per-nonce randomization based on public_key
+    transform_vectors = generate_nonce_transform_vectors(
+        block_hash, public_key, nonces, hidden_size, device, num_reflections=8
     )
-    target = generate_target(block_hash, vocab_size, device)
+    for r in range(transform_vectors.shape[1]):
+        v = transform_vectors[:, r, :]  # [batch, hidden]
+        last_hidden = apply_householder(last_hidden, v)
     
-    distances = compute_distances(logits.float(), permutations, target)
+    # EXPERIMENT: Normalize hidden states to unit sphere before projection
+    # This removes magnitude-based structure ("clumping") from the distribution
+    last_hidden = last_hidden / last_hidden.norm(dim=-1, keepdim=True)
+    
+    # Use RANDOM lm_head projection instead of trained lm_head
+    # This ensures consistent distribution across all block_hashes
+    # The random projection is seeded by block_hash for reproducibility
+    # Using POC_OUTPUT_DIM (8192) instead of vocab_size saves ~18x memory
+    random_lm_head = _generate_random_lm_head(block_hash, hidden_size, POC_OUTPUT_DIM, device)
+    logits = last_hidden @ random_lm_head.T  # [batch, POC_OUTPUT_DIM]
+    
+    # Generate target and compute distances (same dimension as output)
+    target = generate_target(block_hash, POC_OUTPUT_DIM, device)
+    distances = compute_distances_direct(logits.float(), target)
     
     return {
         "nonces": nonces,

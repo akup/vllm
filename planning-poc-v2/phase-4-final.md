@@ -136,14 +136,16 @@ ALL TESTS PASSED!
 
 ## r_target Calibration
 
-**Important**: The theoretical `estimate_R_from_experiment(n=vocab_size, P)` formula assumes random unit vectors, but model outputs have structure that compresses distances:
+**UPDATE (Phase 4.2)**: With per-layer normalization and random lm_head (POC_OUTPUT_DIM=8192), the distribution is now **consistent across models and block_hashes**:
 
-| Model | Theoretical R | Actual Distances | Calibrated r_target |
-|-------|--------------|------------------|---------------------|
-| Qwen | ~1.41 | 1.14-1.16 | ~1.145 (empirical) |
-| Llama | ~1.41 | 1.34-1.38 | ~1.35 (empirical) |
+| Model | p10 (10% valid) | Cross-Block Spread |
+|-------|-----------------|-------------------|
+| Qwen/Qwen3-0.6B | ~1.404 | 3.5% |
+| unsloth/Llama-3.2-1B-Instruct | ~1.407 | 2.0% |
 
-r_target must be empirically calibrated per model based on actual distance distributions.
+**Recommended r_target**: ~1.405 for 10% valid rate (works for both models)
+
+The previous model-specific calibration (Qwen ~1.145, Llama ~1.35) is **obsolete** - per-layer normalization breaks the trained model structure that caused those compressed distributions.
 
 ## Usage
 

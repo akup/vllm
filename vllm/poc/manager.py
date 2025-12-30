@@ -71,7 +71,11 @@ class PoCManager:
         return torch.device("cuda:0")
     
     def init_round(self, config: PoCConfig) -> None:
-        """Initialize round with config. Does not start generating."""
+        """Initialize round with config. Does not start generating.
+        
+        Sets up per-round layer Householder hooks on all workers for
+        structure breaking.
+        """
         if self.state == PoCState.GENERATING:
             raise RuntimeError("Round already in progress")
         
@@ -81,6 +85,30 @@ class PoCManager:
         self.valid_distances = []
         self._nonce_counter = config.node_id
         self.state = PoCState.IDLE
+        
+        # Setup per-round layer hooks on all workers
+        self._setup_layer_hooks()
+    
+    def _setup_layer_hooks(self) -> None:
+        """Setup layer Householder hooks on all workers via collective_rpc."""
+        from .worker_ops import poc_setup_layer_hooks
+        
+        results = self.model_executor.collective_rpc(
+            poc_setup_layer_hooks,
+            args=(
+                self.config.block_hash,
+                self.model_config.get_hidden_size(),
+            ),
+        )
+    
+    def _teardown_layer_hooks(self) -> None:
+        """Remove layer hooks from all workers via collective_rpc."""
+        from .worker_ops import poc_teardown_layer_hooks
+        
+        self.model_executor.collective_rpc(
+            poc_teardown_layer_hooks,
+            args=(),
+        )
     
     def start_generate(self) -> None:
         """Switch to GENERATING state. Call after init_round()."""
@@ -95,8 +123,12 @@ class PoCManager:
         self.state = PoCState.VALIDATING
     
     def stop_round(self) -> None:
-        """Stop current round."""
+        """Stop current round and cleanup layer hooks."""
         self.state = PoCState.STOPPED
+        
+        # Teardown layer hooks
+        if self.config is not None:
+            self._teardown_layer_hooks()
     
     def get_next_nonces(self) -> List[int]:
         """Get next batch of nonces for this node."""

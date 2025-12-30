@@ -66,42 +66,38 @@ def estimate_R(n, P, num_samples=100000):
 
 ### Theoretical vs Empirical Values
 
-Theoretical formula assumes uniform distribution on sphere (random weights). **Trained models have structure** that compresses distances. Always use empirical values.
+**UPDATE (Phase 4.2)**: With per-layer normalization and random lm_head (POC_OUTPUT_DIM=8192), the distribution is now **consistent** and matches theoretical values:
 
-| Model | Theoretical (10%) | Empirical (10%) | Mean Distance |
-|-------|------------------|-----------------|---------------|
-| Qwen/Qwen3-0.6B | 1.4119 | **1.1739** | 1.2155 |
-| Llama-3.2-1B-Instruct | 1.4116 | **1.3796** | 1.4486 |
-| Random weights | 1.4119 | 1.4117 | 1.4138 |
+| Model | Theoretical (10%) | Current (10%) | Cross-Block Spread |
+|-------|------------------|---------------|-------------------|
+| Qwen/Qwen3-0.6B | 1.4119 | **~1.404** | 3.5% |
+| Llama-3.2-1B-Instruct | 1.4116 | **~1.407** | 2.0% |
 
-### Empirical Calibration (Use These)
+### Empirical Calibration (UPDATED)
 
-**Qwen/Qwen3-0.6B** (highly compressed distribution):
+**Both Models** (consistent distribution with per-layer normalization):
 ```
- 5% valid: r_target = 1.166
-10% valid: r_target = 1.174
-20% valid: r_target = 1.184
-30% valid: r_target = 1.193
-50% valid: r_target = 1.209
+ 5% valid: r_target ≈ 1.400
+10% valid: r_target ≈ 1.405
+15% valid: r_target ≈ 1.408
 ```
 
-**Llama-3.2-1B-Instruct** (close to theoretical):
+**Note**: The old model-specific values (Qwen ~1.17, Llama ~1.38) are **obsolete**. Per-layer normalization breaks the structure that caused those compressed distributions.
+
+### Key Insight: Per-Layer Normalization Solved Structure Problem
+
+The initial problem was that trained models had structure that caused inconsistent distributions:
+- Different block_hashes → different Householder rotations → different mean distances
+- Result: 49-54% spread in valid rates across block_hashes
+
+**Solution**: Normalize hidden states to unit sphere at each layer:
+```python
+def normalize_and_transform(x):
+    x_norm = x / (x.norm(dim=-1, keepdim=True) + 1e-8)
+    return apply_householder(x_norm, v)
 ```
- 5% valid: r_target = 1.363
-10% valid: r_target = 1.380
-20% valid: r_target = 1.406
-30% valid: r_target = 1.423
-50% valid: r_target = 1.451
-```
 
-### Key Insight: Model Structure
-
-Experiments confirmed (see `logs/experiment_report.md`):
-- Random Qwen (same architecture, random weights): mean = 1.4138 (matches theory)
-- Trained Qwen: mean = 1.2155 (14% lower than theory)
-- Trained Llama: mean = 1.4486 (close to theory)
-
-This proves trained weights create structure that compresses Qwen's output distribution.
+This breaks structure accumulation because normalization is non-linear (unlike orthogonal transforms like Householder, rotations, permutations which preserve structure).
 
 ## Server Logs
 

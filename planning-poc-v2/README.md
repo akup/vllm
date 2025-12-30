@@ -169,7 +169,12 @@ vllm serve Qwen/Qwen3-0.6B --enable-poc --poc-batch-size 32 --poc-seq-len 256
 
 ## Distribution Note (PoC 2.0 vs 1.0)
 
-With a real trained model (not random weights), output distribution may deviate from uniform. The `r_target` should be calibrated per-model to achieve desired valid nonce rate.
+**SOLVED**: Initial experiments showed trained models had inconsistent output distributions across block_hashes (49-54% spread in valid rates). This was solved in Phase 4.2 using:
+
+1. **Per-layer normalization** - Normalizes hidden states to unit sphere at each transformer layer
+2. **Random lm_head projection** - Uses `POC_OUTPUT_DIM=8192` instead of vocab_size (18x memory savings)
+
+**Result**: Cross-block spread reduced to 2-3.5%. A single `r_target` (~1.405 for 10% valid rate) now works across all models and block_hashes.
 
 ## File Structure (Target)
 
@@ -180,7 +185,9 @@ vllm/
 │   ├── config.py        # PoCConfig, PoCState
 │   ├── data.py          # ProofBatch, ValidatedBatch
 │   ├── gpu_random.py    # Deterministic GPU generation
+│   ├── layer_hooks.py   # Per-layer normalization hooks
 │   ├── manager.py       # PoCManager
+│   ├── worker_ops.py    # GPU worker operations (random lm_head)
 │   └── routes.py        # FastAPI endpoints
 └── entrypoints/openai/
     ├── api_server.py    # Add: include_router(poc_router)

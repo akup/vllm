@@ -11,10 +11,12 @@ def _seed_from_string(seed_string: str) -> int:
 
 
 def _murmur3_32(keys: torch.Tensor, seed: int) -> torch.Tensor:
+    """Murmur3 hash for int32 keys. Returns int64 to preserve full uint32 range."""
     c1, c2 = 0xcc9e2d51, 0x1b873593
-    seed_i32 = seed if seed < 0x80000000 else seed - 0x100000000
-    h = torch.full_like(keys, seed_i32, dtype=torch.int32)
-    k = keys.to(torch.int32)
+    
+    # Work in int64 to handle uint32 range properly
+    h = torch.full_like(keys, seed & 0xFFFFFFFF, dtype=torch.int64)
+    k = keys.to(torch.int64) & 0xFFFFFFFF
 
     k = (k * c1) & 0xFFFFFFFF
     k = ((k << 15) | (k >> 17)) & 0xFFFFFFFF
@@ -34,8 +36,8 @@ def _murmur3_32(keys: torch.Tensor, seed: int) -> torch.Tensor:
 
 def _uniform(seed: int, n: int, device: torch.device) -> torch.Tensor:
     indices = torch.arange(n, device=device, dtype=torch.int32)
-    hashes = _murmur3_32(indices, seed)
-    return (hashes.to(torch.float32) + 2147483648.0) / 4294967296.0
+    hashes = _murmur3_32(indices, seed)  # Returns int64 in [0, 2^32)
+    return hashes.to(torch.float32) / 4294967296.0
 
 
 def _normal(seed: int, n: int, device: torch.device) -> torch.Tensor:
@@ -76,6 +78,13 @@ def generate_permutations(
     vocab_size: int,
     device: torch.device,
 ) -> torch.Tensor:
+    """Generate per-nonce permutations for logit reordering.
+    
+    DEPRECATED: Use generate_nonce_transform_vectors + apply_householder instead.
+    Hidden state Householder transforms provide better structure breaking with less memory.
+    
+    Kept for backwards compatibility with tests and experiments.
+    """
     batch_size = len(nonces)
     result = torch.empty(batch_size, vocab_size, device=device, dtype=torch.int64)
 
@@ -108,6 +117,141 @@ def compute_distances(
     permutations: torch.Tensor,
     target: torch.Tensor,
 ) -> torch.Tensor:
+    """Compute distances with logit permutation.
+    
+    DEPRECATED: Use compute_distances_direct instead.
+    The new hidden state transform approach doesn't need permutations.
+    
+    Kept for backwards compatibility with tests and experiments.
+    """
     logits_perm = torch.gather(logits, 1, permutations)
     logits_norm = logits_perm / logits_perm.norm(dim=1, keepdim=True)
     return (logits_norm - target.unsqueeze(0)).norm(dim=1)
+
+
+def generate_householder_vector(
+    seed_str: str,
+    dim: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Generate a single unit vector for Householder reflection."""
+    seed = _seed_from_string(seed_str)
+    v = _normal(seed, dim, device)
+    return v / v.norm()
+
+
+def apply_householder(
+    x: torch.Tensor,
+    v: torch.Tensor,
+) -> torch.Tensor:
+    """Apply Householder reflection: H @ x = x - 2*(v·x)*v
+    
+    Args:
+        x: Input tensor of shape [..., dim]
+        v: Unit vector of shape [dim] or [batch, dim]
+    
+    Returns:
+        Transformed tensor of same shape as x
+    """
+    if v.dim() == 1:
+        dot = (x * v).sum(dim=-1, keepdim=True)
+        return x - 2 * dot * v
+    else:
+        dot = (x * v).sum(dim=-1, keepdim=True)
+        return x - 2 * dot * v
+
+
+def generate_nonce_transform_vectors(
+    block_hash: str,
+    public_key: str,
+    nonces: List[int],
+    dim: int,
+    device: torch.device,
+    num_reflections: int = 4,
+) -> torch.Tensor:
+    """Generate per-nonce Householder vectors for hidden state transform.
+    
+    Args:
+        block_hash: Block hash for deterministic generation
+        public_key: Public key for deterministic generation
+        nonces: List of nonces
+        dim: Hidden dimension size
+        device: Target device
+        num_reflections: Number of Householder reflections per nonce
+    
+    Returns:
+        Tensor of shape [batch_size, num_reflections, dim]
+    """
+    batch_size = len(nonces)
+    vectors = torch.empty(batch_size, num_reflections, dim, device=device, dtype=torch.float32)
+    
+    for i, nonce in enumerate(nonces):
+        for r in range(num_reflections):
+            seed_str = f"{block_hash}_{public_key}_nonce_{nonce}_hidden_r{r}"
+            vectors[i, r] = generate_householder_vector(seed_str, dim, device)
+    
+    return vectors
+
+
+def compute_distances_direct(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """Compute distances from normalized logits to target (no permutation).
+    
+    Args:
+        logits: Logits tensor of shape [batch, vocab_size]
+        target: Target unit vector of shape [vocab_size]
+    
+    Returns:
+        Distances tensor of shape [batch]
+    """
+    logits_norm = logits / logits.norm(dim=1, keepdim=True)
+    return (logits_norm - target.unsqueeze(0)).norm(dim=1)
+
+
+def generate_orthogonal_matrix(
+    seed_str: str,
+    dim: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Generate a random orthogonal matrix using QR decomposition.
+    
+    Uses a random Gaussian matrix and extracts the Q factor.
+    This produces a Haar-distributed random orthogonal matrix.
+    
+    Args:
+        seed_str: Seed string for deterministic generation
+        dim: Matrix dimension (produces dim x dim matrix)
+        device: Target device
+    
+    Returns:
+        Orthogonal matrix of shape [dim, dim]
+    """
+    seed = _seed_from_string(seed_str)
+    # Generate random Gaussian matrix
+    # Need dim*dim random numbers
+    gauss = _normal(seed, dim * dim, device).view(dim, dim)
+    # QR decomposition - Q is orthogonal
+    Q, R = torch.linalg.qr(gauss)
+    # Ensure determinant is +1 (proper rotation, not reflection)
+    # by flipping sign of columns where diagonal of R is negative
+    signs = torch.sign(torch.diag(R))
+    Q = Q * signs.unsqueeze(0)
+    return Q
+
+
+def apply_orthogonal_transform(
+    x: torch.Tensor,
+    Q: torch.Tensor,
+) -> torch.Tensor:
+    """Apply orthogonal transformation: y = x @ Q.T
+    
+    Args:
+        x: Input tensor of shape [..., dim]
+        Q: Orthogonal matrix of shape [dim, dim]
+    
+    Returns:
+        Transformed tensor of same shape as x
+    """
+    return x @ Q.T

@@ -8,7 +8,7 @@
 ARG CUDA_VERSION=12.8.1
 #################### BASE BUILD IMAGE ####################
 # prepare basic build environment
-FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu20.04 AS base
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04 AS base
 ARG CUDA_VERSION=12.8.1
 ARG PYTHON_VERSION=3.12
 ARG TARGETPLATFORM
@@ -111,6 +111,10 @@ ENV MAX_JOBS=${max_jobs}
 # number of threads used by nvcc
 ARG nvcc_threads=8
 ENV NVCC_THREADS=$nvcc_threads
+
+# Override version detection for setuptools_scm if needed
+ARG SETUPTOOLS_SCM_PRETEND_VERSION
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=$SETUPTOOLS_SCM_PRETEND_VERSION
 
 ARG USE_SCCACHE
 ARG SCCACHE_BUCKET_NAME=vllm-build-sccache
