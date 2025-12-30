@@ -134,18 +134,35 @@ ALL TESTS PASSED!
 5. **r_target in responses**: Added to status and callback batches for debugging
 6. **seq_len consistency**: Must match between generation and validation (default: 256)
 
-## r_target Calibration
+## Randomization: Sign Flips (Final Solution)
 
-**UPDATE (Phase 4.2)**: With per-layer normalization and random lm_head (POC_OUTPUT_DIM=8192), the distribution is now **consistent across models and block_hashes**:
+After testing both approaches (36 E2E tests), **Sign Flips** is the recommended randomization:
 
-| Model | p10 (10% valid) | Cross-Block Spread |
-|-------|-----------------|-------------------|
-| Qwen/Qwen3-0.6B | ~1.404 | 3.5% |
-| unsloth/Llama-3.2-1B-Instruct | ~1.407 | 2.0% |
+| Model | Sign Flips | Layer Hooks |
+|-------|------------|-------------|
+| Qwen 0.6B | **1.1%** spread ✓ | 3.9% spread |
+| Llama 1B | **0.9%** spread ✓ | 10.3% spread |
 
-**Recommended r_target**: ~1.405 for 10% valid rate (works for both models)
+**Success Criteria**: Cross-block spread < 5%
 
-The previous model-specific calibration (Qwen ~1.145, Llama ~1.35) is **obsolete** - per-layer normalization breaks the trained model structure that caused those compressed distributions.
+### Why Sign Flips Wins
+- Better consistency (0.9-1.1% vs 3.9-10.3%)
+- Model-agnostic (works equally on Qwen and Llama)
+- Simpler (no forward hooks)
+- Faster (~5% throughput improvement)
+
+### Default Configuration
+```python
+# vllm/poc/config.py
+use_layer_hooks: bool = False  # Alternative
+use_sign_flips: bool = True    # Recommended
+```
+
+### r_target Calibration
+- **~1.405** for 10% valid rate (both models)
+- **~1.416** for ~58% valid rate (used in tests)
+
+Test logs: `planning-poc-v2/test-results/`
 
 ## Usage
 
