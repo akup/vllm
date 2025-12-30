@@ -29,6 +29,37 @@ python scripts/poc_e2e_test.py --models qwen llama
 #   - test_results.json   - Test results summary
 ```
 
+### Full 18-Test Distribution Experiment
+```bash
+# Run complete distribution test (18 tests: 2 models × 3 blocks × 3 public keys)
+python scripts/poc_full_e2e_test.py
+
+# Run with specific models
+python scripts/poc_full_e2e_test.py --models qwen
+python scripts/poc_full_e2e_test.py --models llama
+
+# Adjust test duration (default: 80s per test)
+python scripts/poc_full_e2e_test.py --duration 40
+
+# Monitor progress
+tail -f logs/e2e_results.jsonl
+```
+
+This test validates that the per-layer normalization and random `lm_head` produce **consistent valid rates** across:
+- **2 models**: Qwen/Qwen3-0.6B, unsloth/Llama-3.2-1B-Instruct
+- **3 block hashes**: block_alpha, block_beta, block_gamma
+- **3 public keys**: node_A, node_B, node_C
+
+Each test runs with fresh server + callback instances. Results saved to `logs/e2e_results.jsonl`.
+
+**Expected Results** (with `r_target=1.416`):
+| Model | Valid Rate Range | Spread |
+|-------|-----------------|--------|
+| Qwen  | 58-65%          | ~6%    |
+| Llama | 53-65%          | ~11%   |
+
+**Key Validation**: Valid rates should be consistent across different `public_key` values within the same model/block_hash combination, confirming per-nonce randomization works correctly.
+
 ## E2E Test Phases
 
 1. **Generation Phase**: Start server, generate nonces for 10s, collect valid batches
