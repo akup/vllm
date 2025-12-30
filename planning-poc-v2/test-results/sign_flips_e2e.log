@@ -1,0 +1,249 @@
+======================================================================
+Full E2E Distribution Test
+======================================================================
+Models: ['qwen', 'llama']
+Block hashes: ['block_alpha', 'block_beta', 'block_gamma']
+Public keys: ['node_A', 'node_B', 'node_C']
+r_target: 1.416
+Duration per test: 40s
+Total tests: 18
+Layer hooks: OFF
+Sign flips: ON
+
+Results file: logs/e2e_results.jsonl
+Monitor with: tail -f logs/e2e_results.jsonl
+
+----------------------------------------------------------------------
+Test 1/18: qwen | block_alpha | node_A
+----------------------------------------------------------------------
+    Starting callback receiver...
+    Starting vLLM server (Qwen/Qwen3-0.6B)...
+    Still waiting for server... (10s)
+    Still waiting for server... (20s)
+    Server ready
+    PoC generation started (hooks=OFF+signs), running for 40s...
+    Results: 4960 checked, 2861 valid (57.7%)
+
+----------------------------------------------------------------------
+Test 2/18: qwen | block_alpha | node_B
+----------------------------------------------------------------------
+    Starting callback receiver...
+    Starting vLLM server (Qwen/Qwen3-0.6B)...
+    Still waiting for server... (10s)
+    Still waiting for server... (20s)
+    Server ready
+    PoC generation started (hooks=OFF+signs), running for 40s...
+    Results: 4960 checked, 2900 valid (58.5%)
+
+----------------------------------------------------------------------
+Test 3/18: qwen | block_alpha | node_C
+----------------------------------------------------------------------
+    Starting callback receiver...
+    Starting vLLM server (Qwen/Qwen3-0.6B)...
+    Still waiting for server... (10s)
+    Still waiting for server... (20s)
+    Server ready
+    PoC generation started (hooks=OFF+signs), running for 40s...
+    Results: 4960 checked, 2877 valid (58.0%)
+
+----------------------------------------------------------------------
+Test 4/18: qwen | block_beta | node_A
+----------------------------------------------------------------------
+    Starting callback receiver...
+    Starting vLLM server (Qwen/Qwen3-0.6B)...
+    Still waiting for server... (10s)
+    Still waiting for server... (20s)
+    Server ready
+    PoC generation started (hooks=OFF+signs), running for 40s...
+    Results: 4960 checked, 2960 valid (59.7%)
+
+----------------------------------------------------------------------
+Test 5/18: qwen | block_beta | node_B
+----------------------------------------------------------------------
+    Starting callback receiver...
+    Starting vLLM server (Qwen/Qwen3-0.6B)...
+    Still waiting for server... (10s)
+    Still waiting for server... (20s)
+    Server ready
+    PoC generation started (hooks=OFF+signs), running for 40s...
+    Results: 4960 checked, 2881 valid (58.1%)
+
+----------------------------------------------------------------------
+Test 6/18: qwen | block_beta | node_C
+----------------------------------------------------------------------
+    Starting callback receiver...
+    Starting vLLM server (Qwen/Qwen3-0.6B)...
+    Still waiting for server... (10s)
+    Still waiting for server... (20s)
+    Server ready
+    PoC generation started (hooks=OFF+signs), running for 40s...
+    Results: 4960 checked, 2923 valid (58.9%)
+
+----------------------------------------------------------------------
+Test 7/18: qwen | block_gamma | node_A
+----------------------------------------------------------------------
+    Starting callback receiver...
+    Starting vLLM server (Qwen/Qwen3-0.6B)...
+    Still waiting for server... (10s)
+    Still waiting for server... (20s)
+    Server ready
+    PoC generation started (hooks=OFF+signs), running for 40s...
+    Results: 4960 checked, 2922 valid (58.9%)
+
+----------------------------------------------------------------------
+Test 8/18: qwen | block_gamma | node_B
+----------------------------------------------------------------------
+    Starting callback receiver...
+    Starting vLLM server (Qwen/Qwen3-0.6B)...
+    Still waiting for server... (10s)
+    Still waiting for server... (20s)
+    Server ready
+    PoC generation started (hooks=OFF+signs), running for 40s...
+    Results: 4960 checked, 2959 valid (59.7%)
+
+----------------------------------------------------------------------
+Test 9/18: qwen | block_gamma | node_C
+----------------------------------------------------------------------
+    Starting callback receiver...
+    Starting vLLM server (Qwen/Qwen3-0.6B)...
+    Still waiting for server... (10s)
+    Still waiting for server... (20s)
+    Server ready
+    PoC generation started (hooks=OFF+signs), running for 40s...
+    Results: 4960 checked, 2921 valid (58.9%)
+
+----------------------------------------------------------------------
+Test 10/18: llama | block_alpha | node_A
+----------------------------------------------------------------------
+    Starting callback receiver...
+    Starting vLLM server (unsloth/Llama-3.2-1B-Instruct)...
+    Still waiting for server... (10s)
+    Still waiting for server... (20s)
+    Server ready
+    PoC generation started (hooks=OFF+signs), running for 40s...
+    Results: 3104 checked, 1786 valid (57.5%)
+
+----------------------------------------------------------------------
+Test 11/18: llama | block_alpha | node_B
+----------------------------------------------------------------------
+    Starting callback receiver...
+    Starting vLLM server (unsloth/Llama-3.2-1B-Instruct)...
+    Still waiting for server... (10s)
+    Still waiting for server... (20s)
+    Server ready
+    PoC generation started (hooks=OFF+signs), running for 40s...
+    Results: 3104 checked, 1810 valid (58.3%)
+
+----------------------------------------------------------------------
+Test 12/18: llama | block_alpha | node_C
+----------------------------------------------------------------------
+    Starting callback receiver...
+    Starting vLLM server (unsloth/Llama-3.2-1B-Instruct)...
+    Still waiting for server... (10s)
+    Still waiting for server... (20s)
+    Server ready
+    PoC generation started (hooks=OFF+signs), running for 40s...
+    Results: 3104 checked, 1813 valid (58.4%)
+
+----------------------------------------------------------------------
+Test 13/18: llama | block_beta | node_A
+----------------------------------------------------------------------
+    Starting callback receiver...
+    Starting vLLM server (unsloth/Llama-3.2-1B-Instruct)...
+    Still waiting for server... (10s)
+    Still waiting for server... (20s)
+    Server ready
+    PoC generation started (hooks=OFF+signs), running for 40s...
+    Results: 3104 checked, 1825 valid (58.8%)
+
+----------------------------------------------------------------------
+Test 14/18: llama | block_beta | node_B
+----------------------------------------------------------------------
+    Starting callback receiver...
+    Starting vLLM server (unsloth/Llama-3.2-1B-Instruct)...
+    Still waiting for server... (10s)
+    Still waiting for server... (20s)
+    Server ready
+    PoC generation started (hooks=OFF+signs), running for 40s...
+    Results: 3104 checked, 1779 valid (57.3%)
+
+----------------------------------------------------------------------
+Test 15/18: llama | block_beta | node_C
+----------------------------------------------------------------------
+    Starting callback receiver...
+    Starting vLLM server (unsloth/Llama-3.2-1B-Instruct)...
+    Still waiting for server... (10s)
+    Still waiting for server... (20s)
+    Server ready
+    PoC generation started (hooks=OFF+signs), running for 40s...
+    Results: 3104 checked, 1803 valid (58.1%)
+
+----------------------------------------------------------------------
+Test 16/18: llama | block_gamma | node_A
+----------------------------------------------------------------------
+    Starting callback receiver...
+    Starting vLLM server (unsloth/Llama-3.2-1B-Instruct)...
+    Still waiting for server... (10s)
+    Still waiting for server... (20s)
+    Server ready
+    PoC generation started (hooks=OFF+signs), running for 40s...
+    Results: 3104 checked, 1821 valid (58.7%)
+
+----------------------------------------------------------------------
+Test 17/18: llama | block_gamma | node_B
+----------------------------------------------------------------------
+    Starting callback receiver...
+    Starting vLLM server (unsloth/Llama-3.2-1B-Instruct)...
+    Still waiting for server... (10s)
+    Still waiting for server... (20s)
+    Server ready
+    PoC generation started (hooks=OFF+signs), running for 40s...
+    Results: 3104 checked, 1846 valid (59.5%)
+
+----------------------------------------------------------------------
+Test 18/18: llama | block_gamma | node_C
+----------------------------------------------------------------------
+    Starting callback receiver...
+    Starting vLLM server (unsloth/Llama-3.2-1B-Instruct)...
+    Still waiting for server... (10s)
+    Still waiting for server... (20s)
+    Server ready
+    PoC generation started (hooks=OFF+signs), running for 40s...
+    Results: 3104 checked, 1826 valid (58.8%)
+
+======================================================================
+SUMMARY
+======================================================================
+
+QWEN:
+  [OK] block_alpha  | node_A   | checked= 4960 | valid=2861 | rate=57.7%
+  [OK] block_alpha  | node_B   | checked= 4960 | valid=2900 | rate=58.5%
+  [OK] block_alpha  | node_C   | checked= 4960 | valid=2877 | rate=58.0%
+  [OK] block_beta   | node_A   | checked= 4960 | valid=2960 | rate=59.7%
+  [OK] block_beta   | node_B   | checked= 4960 | valid=2881 | rate=58.1%
+  [OK] block_beta   | node_C   | checked= 4960 | valid=2923 | rate=58.9%
+  [OK] block_gamma  | node_A   | checked= 4960 | valid=2922 | rate=58.9%
+  [OK] block_gamma  | node_B   | checked= 4960 | valid=2959 | rate=59.7%
+  [OK] block_gamma  | node_C   | checked= 4960 | valid=2921 | rate=58.9%
+  ----
+  Valid rate: avg=58.7%, min=57.7%, max=59.7%, spread=2.0%
+
+LLAMA:
+  [OK] block_alpha  | node_A   | checked= 3104 | valid=1786 | rate=57.5%
+  [OK] block_alpha  | node_B   | checked= 3104 | valid=1810 | rate=58.3%
+  [OK] block_alpha  | node_C   | checked= 3104 | valid=1813 | rate=58.4%
+  [OK] block_beta   | node_A   | checked= 3104 | valid=1825 | rate=58.8%
+  [OK] block_beta   | node_B   | checked= 3104 | valid=1779 | rate=57.3%
+  [OK] block_beta   | node_C   | checked= 3104 | valid=1803 | rate=58.1%
+  [OK] block_gamma  | node_A   | checked= 3104 | valid=1821 | rate=58.7%
+  [OK] block_gamma  | node_B   | checked= 3104 | valid=1846 | rate=59.5%
+  [OK] block_gamma  | node_C   | checked= 3104 | valid=1826 | rate=58.8%
+  ----
+  Valid rate: avg=58.4%, min=57.3%, max=59.5%, spread=2.2%
+
+----------------------------------------------------------------------
+Overall valid rate: avg=58.5%, min=57.3%, max=59.7%
+Successful tests: 18/18
+
+Full results: logs/e2e_results.jsonl
+Individual logs: logs/test_*_server.log, logs/test_*_callback.log

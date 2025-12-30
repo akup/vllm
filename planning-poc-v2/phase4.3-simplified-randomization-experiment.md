@@ -1,39 +1,49 @@
-# Phase 4.3: Randomization Layer Options
+# Phase 4.3: Randomization Layer - Sign Flips (Final)
 
-## Two Approaches
+## Recommended Approach: Sign Flips
 
 | Mode | Config | Description |
 |------|--------|-------------|
-| **Layer Hooks** | `use_layer_hooks=True` | Per-layer normalization + Householder. Default. |
-| **Sign Flips** | `use_layer_hooks=False, use_sign_flips=True` | Per-nonce sign flips. Lightweight alternative. |
+| **Sign Flips** ✓ | `use_layer_hooks=False, use_sign_flips=True` | Per-nonce sign flips. **Recommended.** |
+| Layer Hooks | `use_layer_hooks=True` | Per-layer normalization + Householder. Alternative. |
 
-## E2E Test Results (18 tests each)
+## E2E Test Results (18 tests each, 2025-12-30)
 
-| Model | Layer Hooks | Sign Flips |
-|-------|-------------|------------|
-| Qwen 0.6B | 3.1% spread | 1.1% spread |
-| Llama 1B | 2.3% spread | 0.9% spread |
+| Model | Sign Flips | Layer Hooks |
+|-------|------------|-------------|
+| Qwen 0.6B | **1.1% spread** ✓ | 3.9% spread |
+| Llama 1B | **0.9% spread** ✓ | 10.3% spread |
 
-Both approaches achieve < 5% cross-block spread (success criteria).
+**Sign Flips is clearly superior** - consistent <2% cross-block spread on both models.
 
-## When to Use
+## Why Sign Flips Wins
 
-**Layer Hooks** (default):
-- Proven to work on all tested models
-- Breaks clustering during forward pass
-- ~1% performance overhead
+1. **Better consistency**: 0.9-1.1% spread vs 3.9-10.3%
+2. **Model-agnostic**: Works equally well on Qwen and Llama
+3. **Simpler**: No forward hooks, no layer modifications
+4. **Faster**: No overhead from per-layer normalization
 
-**Sign Flips**:
-- Simpler, no model hooks
-- Works by decorrelating final hidden states
-- Slightly better distribution in tests
+## How It Works
+
+```python
+# Per-nonce sign flips decorrelate hidden state directions
+signs = generate_sign_flips(block_hash, public_key, nonces, hidden_size, device)
+last_hidden = last_hidden * signs  # Random +1/-1 per dimension
+
+# Normalize to unit sphere (breaks magnitude structure)
+last_hidden = last_hidden / (last_hidden.norm(dim=-1, keepdim=True) + 1e-8)
+
+# Householder transforms mix dimensions
+for r in range(8):
+    last_hidden = apply_householder(last_hidden, transform_vectors[:, r, :])
+```
 
 ## Implementation
 
 ```python
-# Layer hooks mode (default)
-config = PoCConfig(block_hash=..., use_layer_hooks=True)
-
-# Sign flips mode
+# Sign flips mode (recommended)
 config = PoCConfig(block_hash=..., use_layer_hooks=False, use_sign_flips=True)
+
+# Layer hooks mode (alternative)
+config = PoCConfig(block_hash=..., use_layer_hooks=True)
 ```

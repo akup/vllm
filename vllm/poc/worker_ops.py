@@ -248,16 +248,16 @@ def poc_forward_batch(
         signs = generate_sign_flips(block_hash, public_key, nonces, hidden_size, device)
         last_hidden = last_hidden * signs
     
-    # Per-nonce Householder transform
+    # Normalize to unit sphere first (breaks magnitude structure)
+    last_hidden = last_hidden / (last_hidden.norm(dim=-1, keepdim=True) + 1e-8)
+    
+    # Per-nonce Householder transform (on unit sphere)
     transform_vectors = generate_nonce_transform_vectors(
         block_hash, public_key, nonces, hidden_size, device, num_reflections=8
     )
     for r in range(transform_vectors.shape[1]):
         v = transform_vectors[:, r, :]
         last_hidden = apply_householder(last_hidden, v)
-    
-    # Normalize to unit sphere
-    last_hidden = last_hidden / last_hidden.norm(dim=-1, keepdim=True)
     
     # Random lm_head projection for consistent distribution
     random_lm_head = _generate_random_lm_head(block_hash, hidden_size, POC_OUTPUT_DIM, device)

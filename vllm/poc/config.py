@@ -22,7 +22,7 @@ class PoCConfig:
     batch_size: int = 32
     seq_len: int = 256
     callback_url: Optional[str] = None
-    # Randomization mode: either layer hooks OR sign flips (not both)
-    use_layer_hooks: bool = True   # Per-layer normalization + Householder
-    use_sign_flips: bool = False   # Per-nonce sign flips (alternative to layer hooks)
+    # Randomization mode: sign flips recommended (simpler, better consistency)
+    use_layer_hooks: bool = False  # Per-layer normalization + Householder (alternative)
+    use_sign_flips: bool = True    # Per-nonce sign flips (recommended, <2% cross-block spread)
 
