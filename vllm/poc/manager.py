@@ -194,7 +194,12 @@ class PoCManager:
         
         return batch
     
-    def run_batch_with_state(self) -> dict:
+    def run_batch_with_state(
+        self,
+        *,
+        return_inputs: bool = False,
+        return_outputs: bool = False,
+    ) -> dict:
         """Run batch and return result with state for continuation check.
         
         Returns both batch results and current state, enabling single RPC
@@ -206,21 +211,84 @@ class PoCManager:
                 "state": self.state.value,
             }
         
-        batch = self.run_batch()
-        valid_batch = batch.sub_batch(self.config.r_target)
-        
-        return {
+        # When artifacts are requested, we must bypass `run_batch()` because
+        # ProofBatch only carries (nonces, distances). Instead we call the worker
+        # op directly and keep the same state update semantics.
+        if not (return_inputs or return_outputs):
+            batch = self.run_batch()
+            valid_batch = batch.sub_batch(self.config.r_target)
+            return {
+                "should_continue": self.state == PoCState.GENERATING,
+                "state": self.state.value,
+                "public_key": self.config.public_key,
+                "block_hash": self.config.block_hash,
+                "block_height": self.config.block_height,
+                "node_id": self.config.node_id,
+                "nonces": batch.nonces,
+                "distances": batch.dist,
+                "valid_nonces": valid_batch.nonces,
+                "valid_distances": valid_batch.dist,
+            }
+
+        # Artifact path: call worker op with flags and manually update stats.
+        from .worker_ops import poc_forward_batch
+        nonces = self.get_next_nonces()
+        results = self.model_executor.collective_rpc(
+            poc_forward_batch,
+            args=(
+                self.config.block_hash,
+                self.config.public_key,
+                nonces,
+                self.config.seq_len,
+                self.model_config.get_vocab_size(),
+                self.model_config.get_hidden_size(),
+                self.config.r_target,
+                self.vllm_config,
+                self.config.use_sign_flips,
+                self.config.use_nonce_householder,
+                self.config.use_nonce_orthogonal,
+                self.config.pick_k_dims,
+                return_inputs,
+                return_outputs,
+            ),
+        )
+        result = next((r for r in results if r is not None), None)
+        if result is None:
+            return {
+                "should_continue": False,
+                "state": self.state.value,
+            }
+
+        # Update stats and valid tracking (match run_batch()).
+        self.stats.total_checked += len(nonces)
+        distances = result.get("distances", [])
+        # Distances list is already aligned to `nonces`.
+        valid_nonces = []
+        valid_distances = []
+        for n, d in zip(result.get("nonces", nonces), distances):
+            if d < self.config.r_target:
+                valid_nonces.append(n)
+                valid_distances.append(d)
+        self.stats.total_valid += len(valid_nonces)
+        self.valid_nonces.extend(valid_nonces)
+        self.valid_distances.extend(valid_distances)
+
+        out = {
             "should_continue": self.state == PoCState.GENERATING,
             "state": self.state.value,
             "public_key": self.config.public_key,
             "block_hash": self.config.block_hash,
             "block_height": self.config.block_height,
             "node_id": self.config.node_id,
-            "nonces": batch.nonces,
-            "distances": batch.dist,
-            "valid_nonces": valid_batch.nonces,
-            "valid_distances": valid_batch.dist,
+            "nonces": result.get("nonces", nonces),
+            "distances": distances,
+            "valid_nonces": valid_nonces,
+            "valid_distances": valid_distances,
         }
+        if "artifacts" in result:
+            out["artifacts"] = result["artifacts"]
+        return out
+        # (non-artifact path handled above)
     
     def validate(self, nonces: List[int], public_key: str, 
                  received_dist: Optional[List[float]] = None) -> Dict[str, Any]:

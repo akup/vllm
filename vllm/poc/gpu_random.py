@@ -216,6 +216,7 @@ def generate_sign_flips(
     nonces: List[int],
     dim: int,
     device: torch.device,
+    round_idx: int = 0,
 ) -> torch.Tensor:
     """Generate per-nonce random sign flips (+1 or -1) for each dimension.
     
@@ -237,7 +238,11 @@ def generate_sign_flips(
     signs = torch.empty(batch_size, dim, device=device, dtype=torch.float32)
     
     for i, nonce in enumerate(nonces):
-        seed_str = f"{block_hash}_{public_key}_nonce_{nonce}_signs"
+        # round_idx=0 preserves the original seed string for backwards compatibility.
+        if int(round_idx) == 0:
+            seed_str = f"{block_hash}_{public_key}_nonce_{nonce}_signs"
+        else:
+            seed_str = f"{block_hash}_{public_key}_nonce_{nonce}_signs_r{int(round_idx)}"
         seed = _seed_from_string(seed_str)
         # Generate uniform values and threshold at 0.5 to get +1/-1
         u = _uniform(seed, dim, device)
@@ -361,3 +366,190 @@ def random_pick_orthogonal_transform(
     y = torch.bmm(Q, xk.unsqueeze(-1)).squeeze(-1)
 
     return y, tk
+
+
+# -----------------------------------------------------------------------------
+# Convenience wrappers (reuse production primitives in offline experiments)
+# -----------------------------------------------------------------------------
+
+def unit_normalize(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Normalize vectors to unit norm along the last dimension."""
+    return x / (x.norm(dim=-1, keepdim=True) + eps)
+
+
+def apply_sign_flips_then_normalize(
+    x: torch.Tensor,
+    *,
+    block_hash: str,
+    public_key: str,
+    nonces: List[int],
+    num_rounds: int = 1,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Match PoC semantics: sign flips first, then normalization."""
+    if x.dim() != 2:
+        raise ValueError(f"x must be [B,d], got shape={tuple(x.shape)}")
+    if len(nonces) != x.shape[0]:
+        raise ValueError(f"len(nonces) must match batch size, got {len(nonces)} vs {x.shape[0]}")
+    rounds = int(num_rounds)
+    if rounds <= 0:
+        raise ValueError(f"num_rounds must be positive, got {num_rounds}")
+    signs = None
+    for r in range(rounds):
+        sr = generate_sign_flips(block_hash, public_key, nonces, x.shape[1], x.device, round_idx=r)
+        signs = sr if signs is None else (signs * sr)
+    x = x * signs.to(dtype=x.dtype)
+    return unit_normalize(x, eps=eps)
+
+
+def apply_householder_reflections(
+    x_unit: torch.Tensor,
+    *,
+    block_hash: str,
+    public_key: str,
+    nonces: List[int],
+    num_reflections: int = 8,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Apply per-nonce Householder reflections (full-d) and re-normalize."""
+    if x_unit.dim() != 2:
+        raise ValueError(f"x_unit must be [B,d], got shape={tuple(x_unit.shape)}")
+    if len(nonces) != x_unit.shape[0]:
+        raise ValueError(
+            f"len(nonces) must match batch size, got {len(nonces)} vs {x_unit.shape[0]}"
+        )
+    dim = x_unit.shape[1]
+    tv = generate_nonce_transform_vectors(
+        block_hash, public_key, nonces, dim, x_unit.device, num_reflections=num_reflections
+    )  # [B,R,d]
+    y = x_unit
+    for r in range(tv.shape[1]):
+        y = apply_householder(y, tv[:, r, :].to(dtype=y.dtype))
+    return unit_normalize(y, eps=eps)
+
+
+def slice_k_from_full(
+    x_unit_full: torch.Tensor,
+    *,
+    block_hash: str,
+    public_key: str,
+    nonces: List[int],
+    k: int,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Deterministically pick k dims (per nonce) and return (xk_unit, indices)."""
+    if x_unit_full.dim() != 2:
+        raise ValueError(f"x_unit_full must be [B,d], got shape={tuple(x_unit_full.shape)}")
+    if len(nonces) != x_unit_full.shape[0]:
+        raise ValueError(
+            f"len(nonces) must match batch size, got {len(nonces)} vs {x_unit_full.shape[0]}"
+        )
+    dim = x_unit_full.shape[1]
+    if k <= 0 or k > dim:
+        raise ValueError(f"k must be in [1, dim], got k={k}, dim={dim}")
+    idx = random_pick_indices(block_hash, public_key, nonces, dim, k, x_unit_full.device)
+    xk = torch.gather(x_unit_full, 1, idx)
+    xk = unit_normalize(xk, eps=eps)
+    return xk, idx
+
+
+def orthogonal_transform_k(
+    x_unit_full: torch.Tensor,
+    *,
+    block_hash: str,
+    public_key: str,
+    nonces: List[int],
+    k: int,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Match current PoC orthogonal mode: pick k dims per nonce and rotate by Haar Q[k,k].
+
+    Returns:
+        yk_unit: [B,k]
+        indices: [B,k]
+    """
+    if x_unit_full.dim() != 2:
+        raise ValueError(f"x_unit_full must be [B,d], got shape={tuple(x_unit_full.shape)}")
+    if len(nonces) != x_unit_full.shape[0]:
+        raise ValueError(
+            f"len(nonces) must match batch size, got {len(nonces)} vs {x_unit_full.shape[0]}"
+        )
+    dim = x_unit_full.shape[1]
+    if k <= 0 or k > dim:
+        raise ValueError(f"k must be in [1, dim], got k={k}, dim={dim}")
+    target_full = generate_target(block_hash, dim, x_unit_full.device)
+    yk, _tk = random_pick_orthogonal_transform(
+        x_unit_full, target_full, block_hash, public_key, nonces, k
+    )
+    yk = unit_normalize(yk, eps=eps)
+    # Expose indices explicitly for offline artifact storage.
+    idx = random_pick_indices(block_hash, public_key, nonces, dim, k, x_unit_full.device)
+    return yk, idx
+
+
+def haar_rotate_k(
+    xk_unit: torch.Tensor,
+    *,
+    block_hash: str,
+    public_key: str,
+    nonces: List[int],
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Rotate already-sliced k-vectors by per-nonce Haar Q[k,k] and re-normalize.
+
+    Args:
+        xk_unit: [B,k] float tensor (will be treated as unit vectors; re-normalized)
+        block_hash/public_key/nonces: seeds for deterministic per-nonce Haar
+
+    Returns:
+        yk_unit: [B,k]
+    """
+    if xk_unit.dim() != 2:
+        raise ValueError(f"xk_unit must be [B,k], got shape={tuple(xk_unit.shape)}")
+    if len(nonces) != xk_unit.shape[0]:
+        raise ValueError(
+            f"len(nonces) must match batch size, got {len(nonces)} vs {xk_unit.shape[0]}"
+        )
+    k = int(xk_unit.shape[1])
+    Q = generate_haar_orthogonal_matrices(
+        block_hash, public_key, nonces, k, xk_unit.device, dtype=xk_unit.dtype
+    )  # [B,k,k]
+    y = torch.bmm(Q, xk_unit.unsqueeze(-1)).squeeze(-1)
+    return unit_normalize(y, eps=eps)
+
+
+def fixed_project_full_to_k(
+    x_unit_full: torch.Tensor,
+    *,
+    block_hash: str,
+    public_key: str,
+    k: int,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Project full-d unit vectors to k dims using a single fixed seeded Gaussian matrix.
+
+    This is a *shared* (non-per-nonce) projection intended for offline analysis:
+      A[d,k] ~ N(0,1) seeded by (block_hash, public_key, d, k)
+      xk = normalize(x_full @ A)
+
+    Args:
+        x_unit_full: [B,d] float tensor (treated as unit vectors; normalized internally)
+        block_hash/public_key: seed inputs for deterministic A
+        k: output dimension
+
+    Returns:
+        xk_unit: [B,k]
+    """
+    if x_unit_full.dim() != 2:
+        raise ValueError(f"x_unit_full must be [B,d], got shape={tuple(x_unit_full.shape)}")
+    d = int(x_unit_full.shape[1])
+    if k <= 0 or k > d:
+        raise ValueError(f"k must be in [1, d], got k={k}, d={d}")
+
+    x_unit_full = unit_normalize(x_unit_full, eps=eps)
+
+    seed_str = f"{block_hash}_{public_key}_fixedproj_gaussian_raw_d{d}_k{k}"
+    seed = _seed_from_string(seed_str)
+    A = _normal(seed, d * int(k), x_unit_full.device).view(d, int(k)).to(dtype=x_unit_full.dtype)
+    xk = x_unit_full @ A
+    return unit_normalize(xk, eps=eps)

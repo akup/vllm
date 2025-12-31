@@ -1,5 +1,7 @@
 """PoC (Proof of Compute) API routes for vLLM server."""
 import asyncio
+import base64
+import io
 import time
 from typing import List, Optional, Dict, Any
 
@@ -55,6 +57,44 @@ class PoCValidateRequest(BaseModel):
     nonces: List[int]
     dist: List[float]
     node_id: int
+
+
+class PoCRunBatchArtifactsRequest(BaseModel):
+    """Run a single PoC batch and optionally return artifact payloads.
+
+    Note: Artifact payloads can be large. We intentionally keep `return_inputs`
+    lightweight (it returns an input *spec* that is deterministically
+    regeneratable, not the full tensor).
+    """
+
+    return_inputs: bool = False
+    return_outputs: bool = False
+
+
+def _encode_torch_save_b64(obj: Any) -> Any:
+    """Encode torch Tensors (or nested dict/list of Tensors) as base64 torch.save blobs.
+
+    This allows artifact collection via JSON without huge `tolist()` payloads.
+    The client can decode with:
+        data = base64.b64decode(b64)
+        tensor_or_obj = torch.load(io.BytesIO(data), map_location="cpu")
+    """
+    # Lazy import to avoid torch dependency at import time if PoC disabled.
+    import torch  # type: ignore
+
+    if isinstance(obj, torch.Tensor):
+        bio = io.BytesIO()
+        # Use torch.save for portability (keeps dtype/shape).
+        torch.save(obj.cpu(), bio)
+        return {
+            "_format": "torch_save_b64",
+            "b64": base64.b64encode(bio.getvalue()).decode("ascii"),
+        }
+    if isinstance(obj, dict):
+        return {k: _encode_torch_save_b64(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_encode_torch_save_b64(v) for v in obj]
+    return obj
 
 
 async def get_engine_client(request: Request):
@@ -282,20 +322,41 @@ async def start_generate(request: Request) -> dict:
     await check_poc_enabled(request)
     engine_client = await get_engine_client(request)
     
-    # Check if initialized
+    # Check if initialized: after `/init`, PoC stays in IDLE but has config.
     status = await engine_client.poc_request("status", {})
-    if status.get("state") == PoCState.IDLE.value:
-        raise HTTPException(status_code=400, detail="PoC not initialized")
-    
     r_target = status.get("r_target")
     if r_target is None:
-        raise HTTPException(status_code=400, detail="PoC config missing r_target")
+        raise HTTPException(status_code=400, detail="PoC not initialized (missing config)")
     
     result = await engine_client.poc_request("start_generate", {})
     
     # Start background tasks (no callback URL since round already initialized)
     await _start_generation_tasks(request, engine_client, None, r_target)
     
+    return {"status": "OK", "pow_status": result.get("pow_status", {})}
+
+
+@router.post("/phase/generate_manual")
+async def start_generate_manual(request: Request) -> dict:
+    """Switch to generate mode WITHOUT starting background generation tasks.
+
+    This is intended for offline artifact collection workflows that want to
+    drive batch execution explicitly via `/api/v1/pow/batch` (with
+    return_inputs/return_outputs), without a concurrent background loop
+    consuming nonces.
+    """
+    await check_poc_enabled(request)
+    engine_client = await get_engine_client(request)
+
+    # Check if initialized: after `/init`, PoC stays in IDLE but has config.
+    status = await engine_client.poc_request("status", {})
+    if status.get("r_target") is None:
+        raise HTTPException(status_code=400, detail="PoC not initialized (missing config)")
+
+    # Cancel generation tasks if they exist
+    await _cancel_poc_tasks(id(request.app))
+
+    result = await engine_client.poc_request("start_generate", {})
     return {"status": "OK", "pow_status": result.get("pow_status", {})}
 
 
@@ -330,6 +391,34 @@ async def stop_round(request: Request) -> dict:
     result = await engine_client.poc_request("stop", {})
     
     return {"status": "OK", "pow_status": result.get("pow_status", {})}
+
+
+@router.post("/batch")
+async def run_one_batch_with_optional_artifacts(
+    request: Request, body: PoCRunBatchArtifactsRequest
+) -> dict:
+    """Run one PoC batch and optionally include artifact payloads.
+
+    This is intended for offline artifact collection runs.
+    """
+    await check_poc_enabled(request)
+    engine_client = await get_engine_client(request)
+
+    status = await engine_client.poc_request("status", {})
+    if status.get("state") != PoCState.GENERATING.value:
+        raise HTTPException(
+            status_code=400,
+            detail="PoC must be in GENERATING state to run a batch. "
+            "Call /api/v1/pow/init/generate or /api/v1/pow/phase/generate first.",
+        )
+
+    payload = {
+        "return_inputs": bool(body.return_inputs),
+        "return_outputs": bool(body.return_outputs),
+    }
+    result = await engine_client.poc_request("run_batch_with_state", payload)
+    # Encode any returned tensors into JSON-friendly blobs.
+    return _encode_torch_save_b64(result)
 
 
 @router.get("/status", response_model=PoCStatusResponse)

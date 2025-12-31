@@ -225,6 +225,8 @@ def poc_forward_batch(
     use_nonce_householder: bool = True,
     use_nonce_orthogonal: bool = False,
     pick_k_dims: Optional[int] = None,
+    return_inputs: bool = False,
+    return_outputs: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Execute PoC forward pass following Worker.execute_model() patterns.
     
@@ -279,12 +281,34 @@ def poc_forward_batch(
     
     # Last PP rank: apply per-nonce transform and compute distances
     hidden_states = hidden_states.view(batch_size, seq_len, -1)
-    last_hidden = hidden_states[:, -1, :].float()  # [batch, hidden_size]
+    last_hidden_raw = hidden_states[:, -1, :].float()  # [batch, hidden_size]
+
+    # Optional artifacts (kept lightweight):
+    # - We do NOT return the full inputs tensor by default (it can be very large).
+    #   Instead, return the deterministic inputs spec so clients can regenerate.
+    # - For outputs, we return unit-normalized last_hidden BEFORE per-nonce transforms.
+    artifacts: Dict[str, Any] = {}
+    if return_inputs:
+        artifacts["inputs_spec"] = {
+            "generator": "vllm.poc.gpu_random.generate_inputs",
+            "block_hash": block_hash,
+            "public_key": public_key,
+            "nonces": nonces,
+            "dim": int(hidden_size),
+            "seq_len": int(seq_len),
+        }
+    if return_outputs:
+        artifacts["last_hidden_unit_pre"] = (
+            last_hidden_raw
+            / (last_hidden_raw.norm(dim=-1, keepdim=True) + 1e-8)
+        ).to(dtype=torch.float16)
     
     # Apply random sign flips if enabled (alternative to layer hooks)
     if use_sign_flips:
         signs = generate_sign_flips(block_hash, public_key, nonces, hidden_size, device)
-        last_hidden = last_hidden * signs
+        last_hidden = last_hidden_raw * signs
+    else:
+        last_hidden = last_hidden_raw
     
     # Normalize to unit sphere first (breaks magnitude structure)
     last_hidden = last_hidden / (last_hidden.norm(dim=-1, keepdim=True) + 1e-8)
@@ -331,7 +355,10 @@ def poc_forward_batch(
             distances = _normalize_distance_for_dim(
                 distances, k_dim=hidden_size, ref_dim=hidden_size
             ).cpu().tolist()
-            return {"nonces": nonces, "distances": distances}
+            out = {"nonces": nonces, "distances": distances}
+            if artifacts:
+                out["artifacts"] = artifacts
+            return out
 
         k = int(pick_k_dims)
         if k <= 0 or k > hidden_size:
@@ -346,7 +373,10 @@ def poc_forward_batch(
         distances = _normalize_distance_for_dim(
             distances, k_dim=k, ref_dim=hidden_size
         ).cpu().tolist()
-        return {"nonces": nonces, "distances": distances}
+        out = {"nonces": nonces, "distances": distances}
+        if artifacts:
+            out["artifacts"] = artifacts
+        return out
     
     # Random lm_head projection for consistent distribution
     random_lm_head = _generate_random_lm_head(block_hash, hidden_size, POC_OUTPUT_DIM, device)
@@ -380,6 +410,7 @@ def poc_forward_batch(
     return {
         "nonces": nonces,
         "distances": distances.cpu().tolist(),
+        **({"artifacts": artifacts} if artifacts else {}),
     }
 
 
