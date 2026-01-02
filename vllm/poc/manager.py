@@ -1,6 +1,6 @@
 import time
 import torch
-from typing import Optional, List, Tuple, Dict, Any, TYPE_CHECKING
+from typing import Optional, List, Dict, Any, TYPE_CHECKING
 from dataclasses import dataclass
 
 from .config import PoCConfig, PoCState
@@ -24,25 +24,9 @@ class PoCStats:
     @property
     def rate(self) -> float:
         return self.total_checked / self.elapsed if self.elapsed > 0 else 0.0
-    
-    def report(self) -> str:
-        """Generate progress report matching original PoW format."""
-        success_rate = self.total_checked / self.total_valid if self.total_valid > 0 else 0
-        elapsed_min = self.elapsed / 60
-        valid_rate = self.total_valid / elapsed_min if elapsed_min > 0 else 0
-        raw_rate = self.total_checked / elapsed_min if elapsed_min > 0 else 0
-        return (f"Generated: {self.total_valid} / {self.total_checked} "
-                f"(1 in {success_rate:.0f}) Time: {elapsed_min:.2f}min "
-                f"({valid_rate:.2f} valid/min, {raw_rate:.2f} raw/min)")
 
 
 class PoCManager:
-    """Manager for PoC (Proof of Computation) rounds.
-    
-    Uses model_executor.collective_rpc() to execute PoC batches on workers,
-    ensuring proper tensor parallel (TP) and pipeline parallel (PP) support.
-    """
-    
     def __init__(
         self,
         model_executor: "ExecutorBase",
@@ -52,8 +36,6 @@ class PoCManager:
         self.model_executor = model_executor
         self.model_config = model_config
         self.vllm_config = vllm_config
-        
-        # Get device from driver worker
         self.device = self._get_device()
         
         self.state = PoCState.IDLE
@@ -65,17 +47,11 @@ class PoCManager:
         self._nonce_counter = 0
     
     def _get_device(self) -> torch.device:
-        """Get device from driver worker."""
         if hasattr(self.model_executor, 'driver_worker'):
             return self.model_executor.driver_worker.device
         return torch.device("cuda:0")
     
     def init_round(self, config: PoCConfig) -> None:
-        """Initialize round with config. Does not start generating.
-        
-        Sets up per-round layer Householder hooks on all workers for
-        structure breaking (unless use_layer_hooks=False for experiments).
-        """
         if self.state == PoCState.GENERATING:
             raise RuntimeError("Round already in progress")
         
@@ -86,15 +62,12 @@ class PoCManager:
         self._nonce_counter = config.node_id
         self.state = PoCState.IDLE
         
-        # Setup per-round layer hooks on all workers (unless disabled for experiment)
-        if config.use_layer_hooks:
-            self._setup_layer_hooks()
+        self._setup_layer_hooks()
     
     def _setup_layer_hooks(self) -> None:
-        """Setup layer Householder hooks on all workers via collective_rpc."""
         from .worker_ops import poc_setup_layer_hooks
         
-        results = self.model_executor.collective_rpc(
+        self.model_executor.collective_rpc(
             poc_setup_layer_hooks,
             args=(
                 self.config.block_hash,
@@ -103,7 +76,6 @@ class PoCManager:
         )
     
     def _teardown_layer_hooks(self) -> None:
-        """Remove layer hooks from all workers via collective_rpc."""
         from .worker_ops import poc_teardown_layer_hooks
         
         self.model_executor.collective_rpc(
@@ -112,27 +84,21 @@ class PoCManager:
         )
     
     def start_generate(self) -> None:
-        """Switch to GENERATING state. Call after init_round()."""
         if self.config is None:
             raise RuntimeError("Round not initialized")
         self.state = PoCState.GENERATING
     
     def start_validate(self) -> None:
-        """Switch to VALIDATING state. Call after init_round()."""
         if self.config is None:
             raise RuntimeError("Round not initialized")
         self.state = PoCState.VALIDATING
     
     def stop_round(self) -> None:
-        """Stop current round and cleanup layer hooks."""
         self.state = PoCState.STOPPED
-        
-        # Teardown layer hooks (only if they were enabled)
-        if self.config is not None and self.config.use_layer_hooks:
+        if self.config is not None:
             self._teardown_layer_hooks()
     
     def get_next_nonces(self) -> List[int]:
-        """Get next batch of nonces for this node."""
         nonces = []
         for _ in range(self.config.batch_size):
             nonces.append(self._nonce_counter)
@@ -140,11 +106,6 @@ class PoCManager:
         return nonces
     
     def run_batch(self) -> ProofBatch:
-        """Run one batch of nonce computation using collective_rpc.
-        
-        Executes PoC forward pass on all workers via collective_rpc,
-        ensuring proper TP/PP coordination.
-        """
         if self.state != PoCState.GENERATING:
             return ProofBatch.empty()
         
@@ -152,7 +113,6 @@ class PoCManager:
         
         nonces = self.get_next_nonces()
         
-        # Execute via model_executor - handles TP/PP
         results = self.model_executor.collective_rpc(
             poc_forward_batch,
             args=(
@@ -160,18 +120,12 @@ class PoCManager:
                 self.config.public_key,
                 nonces,
                 self.config.seq_len,
-                self.model_config.get_vocab_size(),
                 self.model_config.get_hidden_size(),
                 self.config.r_target,
                 self.vllm_config,
-                self.config.use_sign_flips,
-                self.config.use_nonce_householder,
-                self.config.use_nonce_orthogonal,
-                self.config.pick_k_dims,
             ),
         )
         
-        # Find result from last PP rank (non-None)
         result = next((r for r in results if r is not None), None)
         if result is None:
             return ProofBatch.empty()
@@ -194,108 +148,31 @@ class PoCManager:
         
         return batch
     
-    def run_batch_with_state(
-        self,
-        *,
-        return_inputs: bool = False,
-        return_outputs: bool = False,
-    ) -> dict:
-        """Run batch and return result with state for continuation check.
-        
-        Returns both batch results and current state, enabling single RPC
-        per iteration in the generation loop (no separate status check needed).
-        """
+    def run_batch_with_state(self) -> dict:
         if self.state != PoCState.GENERATING:
             return {
                 "should_continue": False,
                 "state": self.state.value,
             }
         
-        # When artifacts are requested, we must bypass `run_batch()` because
-        # ProofBatch only carries (nonces, distances). Instead we call the worker
-        # op directly and keep the same state update semantics.
-        if not (return_inputs or return_outputs):
-            batch = self.run_batch()
-            valid_batch = batch.sub_batch(self.config.r_target)
-            return {
-                "should_continue": self.state == PoCState.GENERATING,
-                "state": self.state.value,
-                "public_key": self.config.public_key,
-                "block_hash": self.config.block_hash,
-                "block_height": self.config.block_height,
-                "node_id": self.config.node_id,
-                "nonces": batch.nonces,
-                "distances": batch.dist,
-                "valid_nonces": valid_batch.nonces,
-                "valid_distances": valid_batch.dist,
-            }
-
-        # Artifact path: call worker op with flags and manually update stats.
-        from .worker_ops import poc_forward_batch
-        nonces = self.get_next_nonces()
-        results = self.model_executor.collective_rpc(
-            poc_forward_batch,
-            args=(
-                self.config.block_hash,
-                self.config.public_key,
-                nonces,
-                self.config.seq_len,
-                self.model_config.get_vocab_size(),
-                self.model_config.get_hidden_size(),
-                self.config.r_target,
-                self.vllm_config,
-                self.config.use_sign_flips,
-                self.config.use_nonce_householder,
-                self.config.use_nonce_orthogonal,
-                self.config.pick_k_dims,
-                return_inputs,
-                return_outputs,
-            ),
-        )
-        result = next((r for r in results if r is not None), None)
-        if result is None:
-            return {
-                "should_continue": False,
-                "state": self.state.value,
-            }
-
-        # Update stats and valid tracking (match run_batch()).
-        self.stats.total_checked += len(nonces)
-        distances = result.get("distances", [])
-        # Distances list is already aligned to `nonces`.
-        valid_nonces = []
-        valid_distances = []
-        for n, d in zip(result.get("nonces", nonces), distances):
-            if d < self.config.r_target:
-                valid_nonces.append(n)
-                valid_distances.append(d)
-        self.stats.total_valid += len(valid_nonces)
-        self.valid_nonces.extend(valid_nonces)
-        self.valid_distances.extend(valid_distances)
-
-        out = {
+        batch = self.run_batch()
+        valid_batch = batch.sub_batch(self.config.r_target)
+        
+        return {
             "should_continue": self.state == PoCState.GENERATING,
             "state": self.state.value,
             "public_key": self.config.public_key,
             "block_hash": self.config.block_hash,
             "block_height": self.config.block_height,
             "node_id": self.config.node_id,
-            "nonces": result.get("nonces", nonces),
-            "distances": distances,
-            "valid_nonces": valid_nonces,
-            "valid_distances": valid_distances,
+            "nonces": batch.nonces,
+            "distances": batch.dist,
+            "valid_nonces": valid_batch.nonces,
+            "valid_distances": valid_batch.dist,
         }
-        if "artifacts" in result:
-            out["artifacts"] = result["artifacts"]
-        return out
-        # (non-artifact path handled above)
     
     def validate(self, nonces: List[int], public_key: str, 
                  received_dist: Optional[List[float]] = None) -> Dict[str, Any]:
-        """Validate nonces by recomputing distances using collective_rpc.
-        
-        Returns dict with validation results and fraud detection.
-        """
         if self.config is None:
             raise RuntimeError("No round configured")
         
@@ -308,18 +185,12 @@ class PoCManager:
                 public_key,
                 nonces,
                 self.config.seq_len,
-                self.model_config.get_vocab_size(),
                 self.model_config.get_hidden_size(),
                 self.config.r_target,
                 self.vllm_config,
-                self.config.use_sign_flips,
-                self.config.use_nonce_householder,
-                self.config.use_nonce_orthogonal,
-                self.config.pick_k_dims,
             ),
         )
         
-        # Find result from last PP rank (non-None)
         result = next((r for r in results if r is not None), None)
         if result is None:
             raise RuntimeError("No result from validation")
@@ -327,14 +198,11 @@ class PoCManager:
         computed_dist = result["distances"]
         valid_flags = result["valid"]
         
-        # Update validation stats
         self.stats.total_checked += len(nonces)
         self.stats.total_valid += sum(valid_flags)
         
-        # Check for fraud if received distances provided
         fraud_detected = False
         if received_dist is not None and len(received_dist) == len(computed_dist):
-            # Fraud = claimed valid (dist < r_target) but computed invalid (dist >= r_target)
             for recv, comp in zip(received_dist, computed_dist):
                 if recv < self.config.r_target and comp >= self.config.r_target:
                     fraud_detected = True

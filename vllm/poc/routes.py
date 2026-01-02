@@ -1,7 +1,5 @@
 """PoC (Proof of Compute) API routes for vLLM server."""
 import asyncio
-import base64
-import io
 import time
 from typing import List, Optional, Dict, Any
 
@@ -30,13 +28,6 @@ class PoCInitRequest(BaseModel):
     batch_size: int = 32
     seq_len: int = 256
     callback_url: Optional[str] = None
-    # Experiment flags
-    use_layer_hooks: bool = True
-    use_sign_flips: bool = False
-    # Per-nonce transform flags (post-forward, last PP rank)
-    use_nonce_householder: bool = True
-    use_nonce_orthogonal: bool = False
-    pick_k_dims: Optional[int] = None
 
 
 class PoCStatusResponse(BaseModel):
@@ -57,44 +48,6 @@ class PoCValidateRequest(BaseModel):
     nonces: List[int]
     dist: List[float]
     node_id: int
-
-
-class PoCRunBatchArtifactsRequest(BaseModel):
-    """Run a single PoC batch and optionally return artifact payloads.
-
-    Note: Artifact payloads can be large. We intentionally keep `return_inputs`
-    lightweight (it returns an input *spec* that is deterministically
-    regeneratable, not the full tensor).
-    """
-
-    return_inputs: bool = False
-    return_outputs: bool = False
-
-
-def _encode_torch_save_b64(obj: Any) -> Any:
-    """Encode torch Tensors (or nested dict/list of Tensors) as base64 torch.save blobs.
-
-    This allows artifact collection via JSON without huge `tolist()` payloads.
-    The client can decode with:
-        data = base64.b64decode(b64)
-        tensor_or_obj = torch.load(io.BytesIO(data), map_location="cpu")
-    """
-    # Lazy import to avoid torch dependency at import time if PoC disabled.
-    import torch  # type: ignore
-
-    if isinstance(obj, torch.Tensor):
-        bio = io.BytesIO()
-        # Use torch.save for portability (keeps dtype/shape).
-        torch.save(obj.cpu(), bio)
-        return {
-            "_format": "torch_save_b64",
-            "b64": base64.b64encode(bio.getvalue()).decode("ascii"),
-        }
-    if isinstance(obj, dict):
-        return {k: _encode_torch_save_b64(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_encode_torch_save_b64(v) for v in obj]
-    return obj
 
 
 async def get_engine_client(request: Request):
@@ -163,12 +116,12 @@ async def _generation_loop(
             current_time = time.time()
             if current_time - last_report_time >= 5.0:
                 elapsed_min = (current_time - start_time) / 60
-                success_rate = total_checked / total_valid if total_valid > 0 else 0
+                valid_pct = 100 * total_valid / total_checked if total_checked > 0 else 0
                 valid_rate = total_valid / elapsed_min if elapsed_min > 0 else 0
                 raw_rate = total_checked / elapsed_min if elapsed_min > 0 else 0
                 logger.info(f"Generated: {total_valid} / {total_checked} "
-                           f"(1 in {success_rate:.0f}) Time: {elapsed_min:.2f}min "
-                           f"({valid_rate:.2f} valid/min, {raw_rate:.2f} raw/min)")
+                           f"({valid_pct:.1f} from 100) Time: {elapsed_min:.2f}min "
+                           f"({valid_rate:.1f} valid/min, {raw_rate:.0f} raw/min)")
                 last_report_time = current_time
             
             # Put valid batch in queue for sender (non-blocking)
@@ -184,10 +137,10 @@ async def _generation_loop(
                 })
     except asyncio.CancelledError:
         elapsed_min = (time.time() - start_time) / 60
-        success_rate = total_checked / total_valid if total_valid > 0 else 0
+        valid_pct = 100 * total_valid / total_checked if total_checked > 0 else 0
         valid_rate = total_valid / elapsed_min if elapsed_min > 0 else 0
-        logger.info(f"PoC stopped: {total_valid} / {total_checked} (1 in {success_rate:.0f}) "
-                   f"in {elapsed_min:.2f}min ({valid_rate:.2f} valid/min)")
+        logger.info(f"PoC stopped: {total_valid} / {total_checked} ({valid_pct:.1f} from 100) "
+                   f"in {elapsed_min:.2f}min ({valid_rate:.1f} valid/min)")
 
 
 async def _callback_sender_loop(
@@ -394,13 +347,7 @@ async def stop_round(request: Request) -> dict:
 
 
 @router.post("/batch")
-async def run_one_batch_with_optional_artifacts(
-    request: Request, body: PoCRunBatchArtifactsRequest
-) -> dict:
-    """Run one PoC batch and optionally include artifact payloads.
-
-    This is intended for offline artifact collection runs.
-    """
+async def run_one_batch(request: Request) -> dict:
     await check_poc_enabled(request)
     engine_client = await get_engine_client(request)
 
@@ -408,17 +355,10 @@ async def run_one_batch_with_optional_artifacts(
     if status.get("state") != PoCState.GENERATING.value:
         raise HTTPException(
             status_code=400,
-            detail="PoC must be in GENERATING state to run a batch. "
-            "Call /api/v1/pow/init/generate or /api/v1/pow/phase/generate first.",
+            detail="PoC must be in GENERATING state to run a batch.",
         )
 
-    payload = {
-        "return_inputs": bool(body.return_inputs),
-        "return_outputs": bool(body.return_outputs),
-    }
-    result = await engine_client.poc_request("run_batch_with_state", payload)
-    # Encode any returned tensors into JSON-friendly blobs.
-    return _encode_torch_save_b64(result)
+    return await engine_client.poc_request("run_batch_with_state", {})
 
 
 @router.get("/status", response_model=PoCStatusResponse)

@@ -422,13 +422,7 @@ class MQLLMEngine:
             }
 
         elif action == "run_batch_with_state":
-            # Optimized version that returns batch + state in single call
-            return_inputs = bool(payload.get("return_inputs", False))
-            return_outputs = bool(payload.get("return_outputs", False))
-            return manager.run_batch_with_state(
-                return_inputs=return_inputs,
-                return_outputs=return_outputs,
-            )
+            return manager.run_batch_with_state()
 
         elif action == "queue_validation":
             # Validate nonces and return results for callback

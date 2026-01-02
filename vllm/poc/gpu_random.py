@@ -100,13 +100,14 @@ def generate_permutations(
 
 def generate_target(
     block_hash: str,
-    vocab_size: int,
+    public_key: str,
+    dim: int,
     device: torch.device,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    seed_str = f"{block_hash}_target"
+    seed_str = f"{block_hash}_{public_key}_target"
     seed = _seed_from_string(seed_str)
-    normal = _normal(seed, vocab_size, device)
+    normal = _normal(seed, dim, device)
     target = normal.to(dtype)
     target = target / target.norm()
     return target
@@ -477,12 +478,11 @@ def orthogonal_transform_k(
     dim = x_unit_full.shape[1]
     if k <= 0 or k > dim:
         raise ValueError(f"k must be in [1, dim], got k={k}, dim={dim}")
-    target_full = generate_target(block_hash, dim, x_unit_full.device)
+    target_full = generate_target(block_hash, public_key, dim, x_unit_full.device)
     yk, _tk = random_pick_orthogonal_transform(
         x_unit_full, target_full, block_hash, public_key, nonces, k
     )
     yk = unit_normalize(yk, eps=eps)
-    # Expose indices explicitly for offline artifact storage.
     idx = random_pick_indices(block_hash, public_key, nonces, dim, k, x_unit_full.device)
     return yk, idx
 

@@ -47,7 +47,7 @@ def test_permutations_determinism():
 
 def test_target_unit_vector():
     device = torch.device("cuda:0")
-    target = generate_target(BLOCK_HASH, vocab_size=1000, device=device)
+    target = generate_target(BLOCK_HASH, PUBLIC_KEY, dim=1000, device=device)
 
     assert abs(target.norm().item() - 1.0) < 1e-5
 
@@ -59,7 +59,7 @@ def test_distance_range():
 
     logits = torch.randn(batch_size, vocab_size, device=device)
     perms = generate_permutations(BLOCK_HASH, PUBLIC_KEY, list(range(batch_size)), vocab_size, device)
-    target = generate_target(BLOCK_HASH, vocab_size, device)
+    target = generate_target(BLOCK_HASH, PUBLIC_KEY, vocab_size, device)
 
     distances = compute_distances(logits, perms, target)
 
@@ -70,8 +70,8 @@ def test_distance_range():
 def test_different_block_hash():
     device = torch.device("cuda:0")
 
-    target1 = generate_target("hash1", vocab_size=1000, device=device)
-    target2 = generate_target("hash2", vocab_size=1000, device=device)
+    target1 = generate_target("hash1", PUBLIC_KEY, dim=1000, device=device)
+    target2 = generate_target("hash2", PUBLIC_KEY, dim=1000, device=device)
 
     assert not torch.allclose(target1, target2)
 
@@ -138,8 +138,8 @@ def test_cpu_gpu_target_match():
     cpu = torch.device("cpu")
     gpu = torch.device("cuda:0")
 
-    target_cpu = generate_target(BLOCK_HASH, vocab_size=1000, device=cpu)
-    target_gpu = generate_target(BLOCK_HASH, vocab_size=1000, device=gpu)
+    target_cpu = generate_target(BLOCK_HASH, PUBLIC_KEY, dim=1000, device=cpu)
+    target_gpu = generate_target(BLOCK_HASH, PUBLIC_KEY, dim=1000, device=gpu)
 
     assert torch.allclose(target_cpu, target_gpu.cpu())
 
@@ -252,7 +252,7 @@ def test_compute_distances_direct_range():
     vocab_size = 1000
     
     logits = torch.randn(batch_size, vocab_size, device=device)
-    target = generate_target(BLOCK_HASH, vocab_size, device)
+    target = generate_target(BLOCK_HASH, PUBLIC_KEY, vocab_size, device)
     
     distances = compute_distances_direct(logits, target)
     
