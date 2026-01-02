@@ -3,18 +3,18 @@ import pytest
 
 from vllm.poc.gpu_random import (
     generate_inputs,
-    generate_permutations,
     generate_target,
-    compute_distances,
     generate_householder_vector,
     apply_householder,
-    generate_nonce_transform_vectors,
-    compute_distances_direct,
+    random_pick_indices,
+    generate_haar_orthogonal_matrices,
 )
 
 BLOCK_HASH = "test_block_hash_12345"
 PUBLIC_KEY = "test_public_key"
 
+
+# === Input Generation Tests ===
 
 def test_inputs_determinism():
     device = torch.device("cuda:0")
@@ -35,47 +35,6 @@ def test_inputs_different_nonces():
     assert not torch.allclose(inputs1, inputs2)
 
 
-def test_permutations_determinism():
-    device = torch.device("cuda:0")
-    nonces = [1, 2, 3]
-
-    perm1 = generate_permutations(BLOCK_HASH, PUBLIC_KEY, nonces, vocab_size=1000, device=device)
-    perm2 = generate_permutations(BLOCK_HASH, PUBLIC_KEY, nonces, vocab_size=1000, device=device)
-
-    assert torch.equal(perm1, perm2)
-
-
-def test_target_unit_vector():
-    device = torch.device("cuda:0")
-    target = generate_target(BLOCK_HASH, PUBLIC_KEY, dim=1000, device=device)
-
-    assert abs(target.norm().item() - 1.0) < 1e-5
-
-
-def test_distance_range():
-    device = torch.device("cuda:0")
-    batch_size = 10
-    vocab_size = 1000
-
-    logits = torch.randn(batch_size, vocab_size, device=device)
-    perms = generate_permutations(BLOCK_HASH, PUBLIC_KEY, list(range(batch_size)), vocab_size, device)
-    target = generate_target(BLOCK_HASH, PUBLIC_KEY, vocab_size, device)
-
-    distances = compute_distances(logits, perms, target)
-
-    assert (distances >= 0).all()
-    assert (distances <= 2).all()
-
-
-def test_different_block_hash():
-    device = torch.device("cuda:0")
-
-    target1 = generate_target("hash1", PUBLIC_KEY, dim=1000, device=device)
-    target2 = generate_target("hash2", PUBLIC_KEY, dim=1000, device=device)
-
-    assert not torch.allclose(target1, target2)
-
-
 def test_different_block_hash_produces_different_inputs():
     """Different block_hash produces different input tensors"""
     device = torch.device("cuda:0")
@@ -92,24 +51,6 @@ def test_different_public_key_produces_different_inputs():
     assert not torch.allclose(inputs1, inputs2)
 
 
-def test_permutation_is_valid():
-    """Each permutation contains all indices 0 to vocab_size-1"""
-    device = torch.device("cuda:0")
-    vocab_size = 1000
-    perms = generate_permutations(BLOCK_HASH, PUBLIC_KEY, [0], vocab_size, device)
-    sorted_perm = torch.sort(perms[0]).values
-    expected = torch.arange(vocab_size, device=device)
-    assert torch.equal(sorted_perm, expected)
-
-
-def test_different_public_key_produces_different_permutations():
-    """Different public_key produces different permutations"""
-    device = torch.device("cuda:0")
-    perm1 = generate_permutations(BLOCK_HASH, "node1", [0], vocab_size=1000, device=device)
-    perm2 = generate_permutations(BLOCK_HASH, "node2", [0], vocab_size=1000, device=device)
-    assert not torch.equal(perm1, perm2)
-
-
 def test_cpu_gpu_inputs_match():
     """CPU and GPU produce identical inputs (cross-device reproducibility)"""
     cpu = torch.device("cpu")
@@ -122,15 +63,22 @@ def test_cpu_gpu_inputs_match():
     assert torch.allclose(inputs_cpu, inputs_gpu.cpu(), rtol=1e-3, atol=1e-3)
 
 
-def test_cpu_gpu_permutations_match():
-    """CPU and GPU produce identical permutations (cross-device reproducibility)"""
-    cpu = torch.device("cpu")
-    gpu = torch.device("cuda:0")
+# === Target Generation Tests ===
 
-    perm_cpu = generate_permutations(BLOCK_HASH, PUBLIC_KEY, [0, 1, 2], vocab_size=1000, device=cpu)
-    perm_gpu = generate_permutations(BLOCK_HASH, PUBLIC_KEY, [0, 1, 2], vocab_size=1000, device=gpu)
+def test_target_unit_vector():
+    device = torch.device("cuda:0")
+    target = generate_target(BLOCK_HASH, PUBLIC_KEY, dim=1000, device=device)
 
-    assert torch.equal(perm_cpu, perm_gpu.cpu())
+    assert abs(target.norm().item() - 1.0) < 1e-5
+
+
+def test_different_block_hash():
+    device = torch.device("cuda:0")
+
+    target1 = generate_target("hash1", PUBLIC_KEY, dim=1000, device=device)
+    target2 = generate_target("hash2", PUBLIC_KEY, dim=1000, device=device)
+
+    assert not torch.allclose(target1, target2)
 
 
 def test_cpu_gpu_target_match():
@@ -196,70 +144,6 @@ def test_apply_householder_is_involutory():
     assert torch.allclose(x, x_twice, rtol=1e-3, atol=1e-5)
 
 
-def test_nonce_transform_vectors_shape():
-    """generate_nonce_transform_vectors returns correct shape"""
-    device = torch.device("cuda:0")
-    nonces = [0, 1, 2, 3, 4]
-    num_reflections = 4
-    dim = 1024
-    
-    vectors = generate_nonce_transform_vectors(
-        BLOCK_HASH, PUBLIC_KEY, nonces, dim, device, num_reflections
-    )
-    
-    assert vectors.shape == (len(nonces), num_reflections, dim)
-
-
-def test_nonce_transform_vectors_determinism():
-    """Same inputs produce same transform vectors"""
-    device = torch.device("cuda:0")
-    nonces = [0, 1, 2]
-    
-    v1 = generate_nonce_transform_vectors(BLOCK_HASH, PUBLIC_KEY, nonces, 1024, device, 4)
-    v2 = generate_nonce_transform_vectors(BLOCK_HASH, PUBLIC_KEY, nonces, 1024, device, 4)
-    
-    assert torch.allclose(v1, v2)
-
-
-def test_nonce_transform_vectors_different_nonces():
-    """Different nonces produce different transform vectors"""
-    device = torch.device("cuda:0")
-    
-    v1 = generate_nonce_transform_vectors(BLOCK_HASH, PUBLIC_KEY, [0], 1024, device, 4)
-    v2 = generate_nonce_transform_vectors(BLOCK_HASH, PUBLIC_KEY, [1], 1024, device, 4)
-    
-    assert not torch.allclose(v1, v2)
-
-
-def test_nonce_transform_vectors_are_unit():
-    """All generated transform vectors should be unit vectors"""
-    device = torch.device("cuda:0")
-    nonces = [0, 1, 2]
-    
-    vectors = generate_nonce_transform_vectors(BLOCK_HASH, PUBLIC_KEY, nonces, 1024, device, 4)
-    
-    # Check each vector is unit
-    for i in range(len(nonces)):
-        for r in range(4):
-            norm = vectors[i, r].norm().item()
-            assert abs(norm - 1.0) < 1e-5
-
-
-def test_compute_distances_direct_range():
-    """compute_distances_direct returns distances in valid range [0, 2]"""
-    device = torch.device("cuda:0")
-    batch_size = 10
-    vocab_size = 1000
-    
-    logits = torch.randn(batch_size, vocab_size, device=device)
-    target = generate_target(BLOCK_HASH, PUBLIC_KEY, vocab_size, device)
-    
-    distances = compute_distances_direct(logits, target)
-    
-    assert (distances >= 0).all()
-    assert (distances <= 2).all()
-
-
 def test_cpu_gpu_householder_match():
     """CPU and GPU produce identical Householder vectors"""
     cpu = torch.device("cpu")
@@ -269,3 +153,168 @@ def test_cpu_gpu_householder_match():
     v_gpu = generate_householder_vector("test", dim=1024, device=gpu)
     
     assert torch.allclose(v_cpu, v_gpu.cpu())
+
+
+# === Random Pick Indices Tests ===
+
+def test_random_pick_indices_determinism():
+    """Same inputs produce same indices"""
+    device = torch.device("cuda:0")
+    nonces = [0, 1, 2]
+    
+    idx1 = random_pick_indices(BLOCK_HASH, PUBLIC_KEY, nonces, dim=1000, k=64, device=device)
+    idx2 = random_pick_indices(BLOCK_HASH, PUBLIC_KEY, nonces, dim=1000, k=64, device=device)
+    
+    assert torch.equal(idx1, idx2)
+
+
+def test_random_pick_indices_shape():
+    """random_pick_indices returns correct shape"""
+    device = torch.device("cuda:0")
+    nonces = [0, 1, 2, 3, 4]
+    k = 64
+    
+    indices = random_pick_indices(BLOCK_HASH, PUBLIC_KEY, nonces, dim=1000, k=k, device=device)
+    
+    assert indices.shape == (len(nonces), k)
+    assert indices.dtype == torch.int64
+
+
+def test_random_pick_indices_range():
+    """Indices are within valid range [0, dim)"""
+    device = torch.device("cuda:0")
+    dim = 1000
+    k = 64
+    
+    indices = random_pick_indices(BLOCK_HASH, PUBLIC_KEY, [0, 1, 2], dim=dim, k=k, device=device)
+    
+    assert (indices >= 0).all()
+    assert (indices < dim).all()
+
+
+def test_random_pick_indices_uniqueness():
+    """Each nonce's indices are unique (no replacement)"""
+    device = torch.device("cuda:0")
+    k = 64
+    
+    indices = random_pick_indices(BLOCK_HASH, PUBLIC_KEY, [0], dim=1000, k=k, device=device)
+    
+    # Check all indices are unique for this nonce
+    unique_count = len(torch.unique(indices[0]))
+    assert unique_count == k
+
+
+def test_random_pick_indices_different_nonces():
+    """Different nonces produce different indices"""
+    device = torch.device("cuda:0")
+    
+    idx1 = random_pick_indices(BLOCK_HASH, PUBLIC_KEY, [0], dim=1000, k=64, device=device)
+    idx2 = random_pick_indices(BLOCK_HASH, PUBLIC_KEY, [1], dim=1000, k=64, device=device)
+    
+    # Different nonces should produce different index sets (with high probability)
+    assert not torch.equal(idx1, idx2)
+
+
+def test_random_pick_indices_invalid_k():
+    """Invalid k values raise ValueError"""
+    device = torch.device("cuda:0")
+    
+    with pytest.raises(ValueError):
+        random_pick_indices(BLOCK_HASH, PUBLIC_KEY, [0], dim=1000, k=0, device=device)
+    
+    with pytest.raises(ValueError):
+        random_pick_indices(BLOCK_HASH, PUBLIC_KEY, [0], dim=1000, k=1001, device=device)
+
+
+def test_cpu_gpu_random_pick_indices_match():
+    """CPU and GPU produce same set of indices (order may differ due to topk impl)"""
+    cpu = torch.device("cpu")
+    gpu = torch.device("cuda:0")
+    
+    idx_cpu = random_pick_indices(BLOCK_HASH, PUBLIC_KEY, [0, 1, 2], dim=1000, k=64, device=cpu)
+    idx_gpu = random_pick_indices(BLOCK_HASH, PUBLIC_KEY, [0, 1, 2], dim=1000, k=64, device=gpu)
+    
+    # Compare sorted indices since topk order is implementation-defined
+    for i in range(idx_cpu.shape[0]):
+        cpu_sorted = torch.sort(idx_cpu[i]).values
+        gpu_sorted = torch.sort(idx_gpu[i].cpu()).values
+        assert torch.equal(cpu_sorted, gpu_sorted)
+
+
+# === Haar Orthogonal Matrices Tests ===
+
+def test_haar_orthogonal_matrices_determinism():
+    """Same inputs produce same matrices"""
+    device = torch.device("cuda:0")
+    nonces = [0, 1, 2]
+    
+    Q1 = generate_haar_orthogonal_matrices(BLOCK_HASH, PUBLIC_KEY, nonces, k=64, device=device)
+    Q2 = generate_haar_orthogonal_matrices(BLOCK_HASH, PUBLIC_KEY, nonces, k=64, device=device)
+    
+    assert torch.allclose(Q1, Q2)
+
+
+def test_haar_orthogonal_matrices_shape():
+    """generate_haar_orthogonal_matrices returns correct shape"""
+    device = torch.device("cuda:0")
+    nonces = [0, 1, 2, 3, 4]
+    k = 64
+    
+    Q = generate_haar_orthogonal_matrices(BLOCK_HASH, PUBLIC_KEY, nonces, k=k, device=device)
+    
+    assert Q.shape == (len(nonces), k, k)
+
+
+def test_haar_orthogonal_matrices_orthogonality():
+    """Generated matrices are orthogonal (Q @ Q^T = I)"""
+    device = torch.device("cuda:0")
+    k = 64
+    
+    Q = generate_haar_orthogonal_matrices(BLOCK_HASH, PUBLIC_KEY, [0, 1, 2], k=k, device=device)
+    
+    for i in range(Q.shape[0]):
+        QQt = Q[i] @ Q[i].T
+        identity = torch.eye(k, device=device, dtype=Q.dtype)
+        assert torch.allclose(QQt, identity, atol=1e-5)
+
+
+def test_haar_orthogonal_matrices_determinant():
+    """Orthogonal matrices have determinant +/- 1"""
+    device = torch.device("cuda:0")
+    k = 32  # Smaller k for faster determinant computation
+    
+    Q = generate_haar_orthogonal_matrices(BLOCK_HASH, PUBLIC_KEY, [0, 1, 2], k=k, device=device)
+    
+    for i in range(Q.shape[0]):
+        det = torch.linalg.det(Q[i])
+        assert abs(abs(det.item()) - 1.0) < 1e-4
+
+
+def test_haar_orthogonal_matrices_different_nonces():
+    """Different nonces produce different matrices"""
+    device = torch.device("cuda:0")
+    
+    Q1 = generate_haar_orthogonal_matrices(BLOCK_HASH, PUBLIC_KEY, [0], k=64, device=device)
+    Q2 = generate_haar_orthogonal_matrices(BLOCK_HASH, PUBLIC_KEY, [1], k=64, device=device)
+    
+    assert not torch.allclose(Q1, Q2)
+
+
+def test_haar_orthogonal_matrices_invalid_k():
+    """Invalid k values raise ValueError"""
+    device = torch.device("cuda:0")
+    
+    with pytest.raises(ValueError):
+        generate_haar_orthogonal_matrices(BLOCK_HASH, PUBLIC_KEY, [0], k=0, device=device)
+
+
+def test_cpu_gpu_haar_matrices_match():
+    """CPU and GPU produce identical Haar matrices (small numerical tolerance)"""
+    cpu = torch.device("cpu")
+    gpu = torch.device("cuda:0")
+    
+    Q_cpu = generate_haar_orthogonal_matrices(BLOCK_HASH, PUBLIC_KEY, [0, 1], k=32, device=cpu)
+    Q_gpu = generate_haar_orthogonal_matrices(BLOCK_HASH, PUBLIC_KEY, [0, 1], k=32, device=gpu)
+    
+    # QR decomposition may have small numerical differences across devices
+    assert torch.allclose(Q_cpu, Q_gpu.cpu(), rtol=1e-4, atol=1e-5)

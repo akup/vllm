@@ -289,30 +289,6 @@ async def start_generate(request: Request) -> dict:
     return {"status": "OK", "pow_status": result.get("pow_status", {})}
 
 
-@router.post("/phase/generate_manual")
-async def start_generate_manual(request: Request) -> dict:
-    """Switch to generate mode WITHOUT starting background generation tasks.
-
-    This is intended for offline artifact collection workflows that want to
-    drive batch execution explicitly via `/api/v1/pow/batch` (with
-    return_inputs/return_outputs), without a concurrent background loop
-    consuming nonces.
-    """
-    await check_poc_enabled(request)
-    engine_client = await get_engine_client(request)
-
-    # Check if initialized: after `/init`, PoC stays in IDLE but has config.
-    status = await engine_client.poc_request("status", {})
-    if status.get("r_target") is None:
-        raise HTTPException(status_code=400, detail="PoC not initialized (missing config)")
-
-    # Cancel generation tasks if they exist
-    await _cancel_poc_tasks(id(request.app))
-
-    result = await engine_client.poc_request("start_generate", {})
-    return {"status": "OK", "pow_status": result.get("pow_status", {})}
-
-
 @router.post("/phase/validate")
 async def start_validate(request: Request) -> dict:
     """Switch to validate mode."""

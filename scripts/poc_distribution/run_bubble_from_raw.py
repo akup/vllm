@@ -37,7 +37,7 @@ if str(_THIS_DIR) not in sys.path:
 
 from bubble_plot import plot_bubble_rate_hist  # type: ignore
 
-from vllm.poc.gpu_random import (
+from gpu_random_utils import (
     apply_householder_reflections,
     apply_sign_flips_then_normalize,
     fixed_project_full_to_k,
