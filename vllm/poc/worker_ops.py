@@ -9,7 +9,6 @@ from typing import List, Optional, Dict, Any
 from vllm.distributed import get_pp_group, get_tp_group
 from vllm.sequence import IntermediateTensors
 from vllm.forward_context import set_forward_context
-from vllm.attention.backends.flash_attn import FlashAttentionMetadata
 from vllm.attention.backends.utils import PAD_SLOT_ID
 
 from .gpu_random import (
@@ -68,7 +67,9 @@ def _create_prefill_attn_metadata(
     batch_size: int,
     seq_len: int,
     device: torch.device,
-) -> FlashAttentionMetadata:
+    attn_backend,
+):
+    """Create prefill attention metadata for the given backend."""
     num_tokens = batch_size * seq_len
     seq_lens = [seq_len] * batch_size
     
@@ -77,23 +78,62 @@ def _create_prefill_attn_metadata(
         torch.tensor(seq_lens, dtype=torch.int32, device=device), dim=0
     )
     
-    return FlashAttentionMetadata(
-        num_prefills=batch_size,
-        num_prefill_tokens=num_tokens,
-        num_decode_tokens=0,
-        slot_mapping=torch.full((num_tokens,), PAD_SLOT_ID, dtype=torch.long, device=device),
-        seq_lens=seq_lens,
-        seq_lens_tensor=torch.tensor(seq_lens, dtype=torch.int, device=device),
-        max_prefill_seq_len=seq_len,
-        max_decode_seq_len=0,
-        query_start_loc=seq_start_loc.clone(),
-        seq_start_loc=seq_start_loc,
-        context_lens_tensor=torch.zeros(batch_size, dtype=torch.int, device=device),
-        block_tables=torch.empty((batch_size, 0), dtype=torch.int, device=device),
-        use_cuda_graph=False,
-        multi_modal_placeholder_index_maps=None,
-        enable_kv_scales_calculation=False,
-    )
+    backend_name = attn_backend.get_name()
+    
+    if backend_name == "XFORMERS":
+        from vllm.attention.backends.xformers import XFormersMetadata
+        return XFormersMetadata(
+            num_prefills=batch_size,
+            num_prefill_tokens=num_tokens,
+            num_decode_tokens=0,
+            slot_mapping=torch.full((num_tokens,), PAD_SLOT_ID, dtype=torch.long, device=device),
+            seq_lens=seq_lens,
+            seq_lens_tensor=torch.tensor(seq_lens, dtype=torch.int, device=device),
+            max_prefill_seq_len=seq_len,
+            max_decode_seq_len=0,
+            query_start_loc=seq_start_loc.clone(),
+            seq_start_loc=seq_start_loc,
+            context_lens_tensor=torch.zeros(batch_size, dtype=torch.int, device=device),
+            block_tables=torch.empty((batch_size, 0), dtype=torch.int, device=device),
+            use_cuda_graph=False,
+            multi_modal_placeholder_index_maps=None,
+            enable_kv_scales_calculation=False,
+        )
+    elif backend_name == "FLASHINFER":
+        from vllm.attention.backends.flashinfer import FlashInferMetadata
+        return FlashInferMetadata(
+            num_prefills=batch_size,
+            num_prefill_tokens=num_tokens,
+            num_decode_tokens=0,
+            slot_mapping=torch.full((num_tokens,), PAD_SLOT_ID, dtype=torch.long, device=device),
+            seq_lens=seq_lens,
+            seq_lens_tensor=torch.tensor(seq_lens, dtype=torch.int, device=device),
+            max_prefill_seq_len=seq_len,
+            max_decode_seq_len=0,
+            query_start_loc=seq_start_loc.clone(),
+            seq_start_loc=seq_start_loc,
+            use_cuda_graph=False,
+        )
+    else:
+        # Default to FlashAttention (FLASH_ATTN, VLLM_FLASH_ATTN, etc.)
+        from vllm.attention.backends.flash_attn import FlashAttentionMetadata
+        return FlashAttentionMetadata(
+            num_prefills=batch_size,
+            num_prefill_tokens=num_tokens,
+            num_decode_tokens=0,
+            slot_mapping=torch.full((num_tokens,), PAD_SLOT_ID, dtype=torch.long, device=device),
+            seq_lens=seq_lens,
+            seq_lens_tensor=torch.tensor(seq_lens, dtype=torch.int, device=device),
+            max_prefill_seq_len=seq_len,
+            max_decode_seq_len=0,
+            query_start_loc=seq_start_loc.clone(),
+            seq_start_loc=seq_start_loc,
+            context_lens_tensor=torch.zeros(batch_size, dtype=torch.int, device=device),
+            block_tables=torch.empty((batch_size, 0), dtype=torch.int, device=device),
+            use_cuda_graph=False,
+            multi_modal_placeholder_index_maps=None,
+            enable_kv_scales_calculation=False,
+        )
 
 
 @torch.inference_mode()
@@ -105,12 +145,15 @@ def poc_forward_batch(
     seq_len: int,
     hidden_size: int,
     r_target: float,
-    vllm_config,
+    vllm_config,  # Kept for API compatibility, but we use worker.vllm_config
 ) -> Optional[Dict[str, Any]]:
     device = worker.device
     dtype = worker.model_runner.model_config.dtype
     model = worker.model_runner.model
     batch_size = len(nonces)
+    
+    # Use worker's vllm_config (has correct static_forward_context for PP)
+    worker_vllm_config = worker.vllm_config
     
     # Generate deterministic inputs
     inputs_embeds = generate_inputs(
@@ -120,7 +163,8 @@ def poc_forward_batch(
     )
     
     positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
-    attn_metadata = _create_prefill_attn_metadata(batch_size, seq_len, device)
+    attn_backend = worker.model_runner.attn_backend
+    attn_metadata = _create_prefill_attn_metadata(batch_size, seq_len, device, attn_backend)
     
     # PP: receive from previous rank
     intermediate_tensors = None
@@ -131,7 +175,7 @@ def poc_forward_batch(
     
     # Forward pass with PoC context active (hooks will transform)
     with poc_forward_context():
-        with set_forward_context(attn_metadata, vllm_config):
+        with set_forward_context(attn_metadata, worker_vllm_config):
             hidden_states = model(
                 input_ids=None,
                 positions=positions.flatten(),
