@@ -25,10 +25,15 @@ ConfigKey = Tuple[str, str, int]  # (block_hash, public_key, block_height)
 @dataclass
 class GenerateGroup:
     config: PoCConfig
+    batch_size: int = 32
     nonce_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     results: Dict[str, List[Dict]] = field(default_factory=dict)
     callbacks: Dict[str, str] = field(default_factory=dict)
     last_callback: float = field(default_factory=time.time)
+    # Stats tracking
+    start_time: float = field(default_factory=time.time)
+    total_processed: int = 0
+    total_valid: int = 0
 
 
 _generate_groups: Dict[ConfigKey, GenerateGroup] = {}
@@ -85,6 +90,7 @@ class PoCGenerateRequest(BaseModel):
     nonces: List[int]
     node_id: int = 0
     seq_len: int = 256
+    batch_size: int = 32
     callback_url: Optional[str] = None
 
 
@@ -121,6 +127,26 @@ async def _cancel_poc_tasks(app_id: int):
                 await tasks["send_task"]
             except asyncio.CancelledError:
                 pass
+
+
+async def _cleanup_generate_groups():
+    """Clean up /generate queues and worker."""
+    global _generate_groups, _generate_worker
+    
+    # Clear all generate groups
+    async with _get_generate_lock():
+        _generate_groups.clear()
+    
+    # Cancel worker task
+    if _generate_worker is not None and not _generate_worker.done():
+        _generate_worker.cancel()
+        try:
+            await _generate_worker
+        except asyncio.CancelledError:
+            pass
+        _generate_worker = None
+    
+    logger.info("Generate queues cleaned up")
 
 
 async def _generation_loop(
@@ -352,8 +378,9 @@ async def stop_round(request: Request) -> dict:
     await check_poc_enabled(request)
     engine_client = await get_engine_client(request)
     
-    # Cancel generation tasks
+    # Cancel all PoC tasks and queues
     await _cancel_poc_tasks(id(request.app))
+    await _cleanup_generate_groups()
     
     result = await engine_client.poc_request("stop", {})
     
@@ -445,13 +472,21 @@ async def _send_generate_callbacks(group: GenerateGroup):
             if not callback_url:
                 continue
             
+            # Extract nonces and distances (matching /init/generate format)
+            nonces = [r["nonce"] for r in results]
+            distances = [r["distance"] for r in results if r["distance"] is not None]
+            
             payload = {
                 "request_id": req_id,
                 "block_hash": group.config.block_hash,
                 "block_height": group.config.block_height,
                 "public_key": group.config.public_key,
-                "results": results,
+                "r_target": group.config.r_target,
+                "nonces": nonces,
+                "dist": distances,
             }
+            
+            logger.info(f"Sending callback: {len(nonces)} nonces to {callback_url}")
             
             try:
                 await session.post(
@@ -464,14 +499,11 @@ async def _send_generate_callbacks(group: GenerateGroup):
                 logger.warning(f"Generate callback failed for {req_id}: {e}")
 
 
-POC_BATCH_SIZE = 32  # Match /init/generate default
-
-
 async def _generate_worker_loop(engine_client):
     """Process nonces from generate groups."""
     global _generate_groups
     
-    logger.info(f"Generate worker started (batch_size={POC_BATCH_SIZE})")
+    logger.info("Generate worker started")
     
     try:
         while _generate_groups:
@@ -481,8 +513,9 @@ async def _generate_worker_loop(engine_client):
                 for key, group in list(_generate_groups.items()):
                     batch_nonces = []
                     batch_req_ids = []
+                    batch_size = group.batch_size
                     
-                    while len(batch_nonces) < POC_BATCH_SIZE:
+                    while len(batch_nonces) < batch_size:
                         try:
                             nonce, req_id = group.nonce_queue.get_nowait()
                             batch_nonces.append(nonce)
@@ -507,18 +540,37 @@ async def _generate_worker_loop(engine_client):
                         "nonces": batch_nonces,
                     })
                     
-                    # Store results under lock
+                    # Store only valid results (distance < r_target)
                     async with _get_generate_lock():
                         if key in _generate_groups:
                             group = _generate_groups[key]
                             distances = result.get("distances", [])
+                            r_target = config.r_target
+                            valid_count = 0
                             for i, req_id in enumerate(batch_req_ids):
-                                if req_id not in group.results:
-                                    group.results[req_id] = []
-                                group.results[req_id].append({
-                                    "nonce": batch_nonces[i],
-                                    "distance": distances[i] if i < len(distances) else None,
-                                })
+                                dist = distances[i] if i < len(distances) else None
+                                if dist is not None and dist < r_target:
+                                    if req_id not in group.results:
+                                        group.results[req_id] = []
+                                    group.results[req_id].append({
+                                        "nonce": batch_nonces[i],
+                                        "distance": dist,
+                                    })
+                                    valid_count += 1
+                            
+                            # Update stats
+                            group.total_processed += len(batch_nonces)
+                            group.total_valid += valid_count
+                            elapsed = (time.time() - group.start_time) / 60.0
+                            valid_rate = group.total_valid / group.total_processed * 100 if group.total_processed else 0
+                            valid_per_min = group.total_valid / elapsed if elapsed > 0 else 0
+                            raw_per_min = group.total_processed / elapsed if elapsed > 0 else 0
+                            
+                            logger.info(
+                                f"Generated: {group.total_valid} / {group.total_processed} "
+                                f"({valid_rate:.1f}%) Time: {elapsed:.2f}min "
+                                f"({valid_per_min:.1f} valid/min, {raw_per_min:.0f} raw/min)"
+                            )
                 except Exception as e:
                     logger.error(f"Generate batch failed: {e}")
             
@@ -589,7 +641,7 @@ async def generate_nonces(request: Request, body: PoCGenerateRequest) -> dict:
                 seq_len=body.seq_len,
                 node_id=body.node_id,
             )
-            _generate_groups[key] = GenerateGroup(config=config)
+            _generate_groups[key] = GenerateGroup(config=config, batch_size=body.batch_size)
         
         group = _generate_groups[key]
         group.results[req_id] = []
