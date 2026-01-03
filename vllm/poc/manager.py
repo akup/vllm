@@ -45,6 +45,7 @@ class PoCManager:
         self.valid_nonces: List[int] = []
         self.valid_distances: List[float] = []
         self._nonce_counter = 0
+        self._generate_block_hash: Optional[str] = None
     
     def _get_device(self) -> torch.device:
         if hasattr(self.model_executor, 'driver_worker'):
@@ -218,6 +219,53 @@ class PoCManager:
             "block_hash": self.config.block_hash,
             "block_height": self.config.block_height,
         }
+    
+    def generate_for_nonces(
+        self,
+        nonces: List[int],
+        block_hash: str,
+        public_key: str,
+        r_target: float,
+        seq_len: int,
+    ) -> Dict[str, Any]:
+        """Generate distances for specific nonces (cached hooks for performance)."""
+        from .worker_ops import poc_forward_batch, poc_setup_layer_hooks
+        
+        # Only setup hooks if block_hash changed (avoid overhead)
+        if self._generate_block_hash != block_hash:
+            self.model_executor.collective_rpc(
+                poc_setup_layer_hooks,
+                args=(block_hash, self.model_config.get_hidden_size()),
+            )
+            self._generate_block_hash = block_hash
+        
+        results = self.model_executor.collective_rpc(
+            poc_forward_batch,
+            args=(
+                block_hash,
+                public_key,
+                nonces,
+                seq_len,
+                self.model_config.get_hidden_size(),
+                r_target,
+                self.vllm_config,
+            ),
+        )
+        
+        result = next((r for r in results if r is not None), None)
+        if result is None:
+            return {"nonces": nonces, "distances": []}
+        
+        return {
+            "nonces": result["nonces"],
+            "distances": result["distances"],
+        }
+    
+    def teardown_generate_hooks(self) -> None:
+        """Teardown cached hooks from generate_for_nonces."""
+        if self._generate_block_hash is not None:
+            self._teardown_layer_hooks()
+            self._generate_block_hash = None
     
     def get_status(self) -> dict:
         return {

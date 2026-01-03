@@ -3,11 +3,40 @@
 Applies transformations between transformer layers to break
 the model's learned output structure.
 """
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import List
 
 import torch
 
 from .gpu_random import generate_householder_vector, apply_householder
+
+# Context variable for conditional hook activation
+# Default False means hooks pass through unchanged (for inference)
+_poc_forward_active: ContextVar[bool] = ContextVar('poc_forward_active', default=False)
+
+
+@contextmanager
+def poc_forward_context():
+    """Context manager for PoC forward passes.
+    
+    Hooks only transform hidden states when this context is active.
+    This allows inference and PoC to coexist without interference.
+    
+    Usage:
+        with poc_forward_context():
+            hidden_states = model(...)  # Hooks will transform
+    """
+    token = _poc_forward_active.set(True)
+    try:
+        yield
+    finally:
+        _poc_forward_active.reset(token)
+
+
+def is_poc_forward_active() -> bool:
+    """Check if PoC forward context is active."""
+    return _poc_forward_active.get()
 
 
 class LayerHouseholderHook:
@@ -74,6 +103,9 @@ class LayerHouseholderHook:
     def _create_hook(self, layer_idx: int):
         """Create a forward hook that applies Householder reflection.
         
+        Hook only transforms when poc_forward_context is active.
+        This allows inference to proceed unaffected when PoC hooks are registered.
+        
         vLLM decoder layers typically return (hidden_states, residual).
         We must transform BOTH to prevent residual connections from
         preserving untransformed values.
@@ -82,6 +114,10 @@ class LayerHouseholderHook:
         magnitude-based structure accumulation.
         """
         def hook(module, input, output):
+            # Early exit if not in PoC forward context - pass through unchanged
+            if not is_poc_forward_active():
+                return output
+            
             v = self.reflection_vectors[layer_idx]
             
             def normalize_and_transform(x):

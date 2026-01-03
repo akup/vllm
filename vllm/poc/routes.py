@@ -1,13 +1,15 @@
 """PoC (Proof of Compute) API routes for vLLM server."""
 import asyncio
 import time
-from typing import List, Optional, Dict, Any
+import uuid
+from dataclasses import dataclass, field
+from typing import List, Optional, Dict, Any, Tuple
 
 from fastapi import APIRouter, Request, HTTPException
 from pydantic import BaseModel
 
 from vllm.logger import init_logger
-from .config import PoCState
+from .config import PoCState, PoCConfig
 
 logger = init_logger(__name__)
 
@@ -15,6 +17,30 @@ router = APIRouter(prefix="/api/v1/pow", tags=["PoC"])
 
 # Module-level state for PoC tasks (per-app, keyed by id(app))
 _poc_tasks: Dict[int, Dict[str, Any]] = {}
+
+# Generate endpoint state
+ConfigKey = Tuple[str, str, int]  # (block_hash, public_key, block_height)
+
+
+@dataclass
+class GenerateGroup:
+    config: PoCConfig
+    nonce_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    results: Dict[str, List[Dict]] = field(default_factory=dict)
+    callbacks: Dict[str, str] = field(default_factory=dict)
+    last_callback: float = field(default_factory=time.time)
+
+
+_generate_groups: Dict[ConfigKey, GenerateGroup] = {}
+_generate_worker: Optional[asyncio.Task] = None
+_generate_lock: Optional[asyncio.Lock] = None
+
+
+def _get_generate_lock() -> asyncio.Lock:
+    global _generate_lock
+    if _generate_lock is None:
+        _generate_lock = asyncio.Lock()
+    return _generate_lock
 
 
 class PoCInitRequest(BaseModel):
@@ -48,6 +74,18 @@ class PoCValidateRequest(BaseModel):
     nonces: List[int]
     dist: List[float]
     node_id: int
+
+
+class PoCGenerateRequest(BaseModel):
+    """Request to generate distances for specific nonces."""
+    block_hash: str
+    block_height: int
+    public_key: str
+    r_target: float
+    nonces: List[int]
+    node_id: int = 0
+    seq_len: int = 256
+    callback_url: Optional[str] = None
 
 
 async def get_engine_client(request: Request):
@@ -391,4 +429,180 @@ async def validate_nonces(request: Request, body: PoCValidateRequest) -> dict:
         "status": "OK", 
         "fraud_detected": result.get("fraud_detected", False),
         "computed_distances": result.get("computed_distances", []),
+    }
+
+
+async def _send_generate_callbacks(group: GenerateGroup):
+    """Send accumulated results to callback URLs."""
+    import aiohttp
+    
+    async with aiohttp.ClientSession() as session:
+        for req_id, results in list(group.results.items()):
+            if not results:
+                continue
+            
+            callback_url = group.callbacks.get(req_id)
+            if not callback_url:
+                continue
+            
+            payload = {
+                "request_id": req_id,
+                "block_hash": group.config.block_hash,
+                "block_height": group.config.block_height,
+                "public_key": group.config.public_key,
+                "results": results,
+            }
+            
+            try:
+                await session.post(
+                    f"{callback_url}/generated",
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                )
+                group.results[req_id] = []
+            except Exception as e:
+                logger.warning(f"Generate callback failed for {req_id}: {e}")
+
+
+POC_BATCH_SIZE = 32  # Match /init/generate default
+
+
+async def _generate_worker_loop(engine_client):
+    """Process nonces from generate groups."""
+    global _generate_groups
+    
+    logger.info(f"Generate worker started (batch_size={POC_BATCH_SIZE})")
+    
+    try:
+        while _generate_groups:
+            # Collect batch under lock
+            batch_info = None
+            async with _get_generate_lock():
+                for key, group in list(_generate_groups.items()):
+                    batch_nonces = []
+                    batch_req_ids = []
+                    
+                    while len(batch_nonces) < POC_BATCH_SIZE:
+                        try:
+                            nonce, req_id = group.nonce_queue.get_nowait()
+                            batch_nonces.append(nonce)
+                            batch_req_ids.append(req_id)
+                        except asyncio.QueueEmpty:
+                            break
+                    
+                    if batch_nonces:
+                        batch_info = (key, group.config, batch_nonces, batch_req_ids)
+                        break
+            
+            # Process batch without lock
+            if batch_info:
+                key, config, batch_nonces, batch_req_ids = batch_info
+                try:
+                    result = await engine_client.poc_request("generate_for_nonces", {
+                        "block_hash": config.block_hash,
+                        "block_height": config.block_height,
+                        "public_key": config.public_key,
+                        "r_target": config.r_target,
+                        "seq_len": config.seq_len,
+                        "nonces": batch_nonces,
+                    })
+                    
+                    # Store results under lock
+                    async with _get_generate_lock():
+                        if key in _generate_groups:
+                            group = _generate_groups[key]
+                            distances = result.get("distances", [])
+                            for i, req_id in enumerate(batch_req_ids):
+                                if req_id not in group.results:
+                                    group.results[req_id] = []
+                                group.results[req_id].append({
+                                    "nonce": batch_nonces[i],
+                                    "distance": distances[i] if i < len(distances) else None,
+                                })
+                except Exception as e:
+                    logger.error(f"Generate batch failed: {e}")
+            
+            # Check callbacks and cleanup under lock
+            async with _get_generate_lock():
+                for key, group in list(_generate_groups.items()):
+                    has_results = any(r for r in group.results.values())
+                    time_elapsed = time.time() - group.last_callback >= 10.0
+                    queue_done = group.nonce_queue.empty()
+                    
+                    if has_results and (time_elapsed or queue_done):
+                        await _send_generate_callbacks(group)
+                        group.last_callback = time.time()
+                    
+                    if queue_done and not any(r for r in group.results.values()):
+                        del _generate_groups[key]
+            
+            if not batch_info:
+                await asyncio.sleep(0.01)
+    except Exception as e:
+        logger.error(f"Generate worker error: {e}")
+    finally:
+        # Cleanup hooks and release memory when worker stops
+        try:
+            await engine_client.poc_request("teardown_generate_hooks", {})
+        except Exception:
+            pass
+        logger.info("Generate worker stopped")
+
+
+async def _start_generate_worker(engine_client):
+    """Start the generate worker if not running."""
+    global _generate_worker
+    
+    if _generate_worker is None or _generate_worker.done():
+        _generate_worker = asyncio.create_task(
+            _generate_worker_loop(engine_client)
+        )
+
+
+@router.post("/generate")
+async def generate_nonces(request: Request, body: PoCGenerateRequest) -> dict:
+    """Generate distances for specific nonces.
+    
+    Groups requests by (block_hash, public_key, block_height) for efficient batching.
+    Results sent to callback_url/generated every ~10s.
+    """
+    await check_poc_enabled(request)
+    engine_client = await get_engine_client(request)
+    
+    status = await engine_client.poc_request("status", {})
+    if status.get("state") in [PoCState.GENERATING.value, PoCState.VALIDATING.value]:
+        raise HTTPException(
+            status_code=409,
+            detail="Busy with /init/generate or /init/validate"
+        )
+    
+    key: ConfigKey = (body.block_hash, body.public_key, body.block_height)
+    req_id = str(uuid.uuid4())
+    
+    async with _get_generate_lock():
+        if key not in _generate_groups:
+            config = PoCConfig(
+                block_hash=body.block_hash,
+                block_height=body.block_height,
+                public_key=body.public_key,
+                r_target=body.r_target,
+                seq_len=body.seq_len,
+                node_id=body.node_id,
+            )
+            _generate_groups[key] = GenerateGroup(config=config)
+        
+        group = _generate_groups[key]
+        group.results[req_id] = []
+        if body.callback_url:
+            group.callbacks[req_id] = body.callback_url
+        
+        for nonce in body.nonces:
+            await group.nonce_queue.put((nonce, req_id))
+    
+    await _start_generate_worker(engine_client)
+    
+    return {
+        "status": "queued",
+        "request_id": req_id,
+        "queued_count": len(body.nonces),
     }

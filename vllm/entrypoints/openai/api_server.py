@@ -1149,6 +1149,7 @@ async def init_app_state(
     state.log_stats = not args.disable_log_stats
     state.vllm_config = vllm_config
     state.poc_enabled = getattr(args, 'enable_poc', False)
+    state.max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
     model_config = vllm_config.model_config
 
     resolved_chat_template = load_chat_template(args.chat_template)
