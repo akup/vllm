@@ -1239,6 +1239,20 @@ class AsyncLLMEngine(EngineClient):
                 "valid": valid,
             }
         
+        elif action == "generate_for_nonces":
+            return manager.generate_for_nonces(
+                nonces=payload.get("nonces", []),
+                block_hash=payload.get("block_hash", ""),
+                public_key=payload.get("public_key", ""),
+                r_target=payload.get("r_target", 0.5),
+                seq_len=payload.get("seq_len", 256),
+                return_vectors=payload.get("return_vectors", False),
+            )
+        
+        elif action == "teardown_generate_hooks":
+            manager.teardown_generate_hooks()
+            return {"status": "ok"}
+        
         else:
             raise ValueError(f"Unknown PoC action: {action}")
 

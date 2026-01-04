@@ -63,26 +63,28 @@ class PoCManager:
         self._nonce_counter = config.node_id
         self.state = PoCState.IDLE
         
-        self._setup_layer_hooks()
+        # self._setup_layer_hooks()
     
     def _setup_layer_hooks(self) -> None:
-        from .worker_ops import poc_setup_layer_hooks
+        pass
+        # from .worker_ops import poc_setup_layer_hooks
         
-        self.model_executor.collective_rpc(
-            poc_setup_layer_hooks,
-            args=(
-                self.config.block_hash,
-                self.model_config.get_hidden_size(),
-            ),
-        )
+        # self.model_executor.collective_rpc(
+        #     poc_setup_layer_hooks,
+        #     args=(
+        #         self.config.block_hash,
+        #         self.model_config.get_hidden_size(),
+        #     ),
+        # )
     
     def _teardown_layer_hooks(self) -> None:
-        from .worker_ops import poc_teardown_layer_hooks
+        pass
+        # from .worker_ops import poc_teardown_layer_hooks
         
-        self.model_executor.collective_rpc(
-            poc_teardown_layer_hooks,
-            args=(),
-        )
+        # self.model_executor.collective_rpc(
+        #     poc_teardown_layer_hooks,
+        #     args=(),
+        # )
     
     def start_generate(self) -> None:
         if self.config is None:

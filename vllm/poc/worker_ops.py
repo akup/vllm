@@ -17,7 +17,8 @@ from .gpu_random import (
     random_pick_indices,
     generate_haar_orthogonal_matrices,
 )
-from .layer_hooks import LayerHouseholderHook, poc_forward_context
+from .layer_hooks import LayerHouseholderHook
+# , poc_forward_context
 
 _layer_hooks: Optional[LayerHouseholderHook] = None
 
@@ -176,14 +177,14 @@ def poc_forward_batch(
         )
     
     # Forward pass with PoC context active (hooks will transform)
-    with poc_forward_context():
-        with set_forward_context(attn_metadata, worker_vllm_config):
-            hidden_states = model(
-                input_ids=None,
-                positions=positions.flatten(),
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds.view(-1, hidden_size),
-            )
+    # with poc_forward_context():
+    with set_forward_context(attn_metadata, worker_vllm_config):
+        hidden_states = model(
+            input_ids=None,
+            positions=positions.flatten(),
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds.view(-1, hidden_size),
+        )
     
     # PP: send to next rank
     if not get_pp_group().is_last_rank:
