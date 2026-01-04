@@ -21,7 +21,7 @@ from .layer_hooks import LayerHouseholderHook, poc_forward_context
 
 _layer_hooks: Optional[LayerHouseholderHook] = None
 
-POC_PICK_K_DIMS = 64
+POC_PICK_K_DIMS = 12
 
 
 def poc_setup_layer_hooks(
@@ -100,19 +100,20 @@ def _create_prefill_attn_metadata(
             enable_kv_scales_calculation=False,
         )
     elif backend_name == "FLASHINFER":
+        # FlashInfer uses flash_attn_varlen_func when is_profile_run=True,
+        # which is what we want for PoC since we don't use KV cache.
         from vllm.attention.backends.flashinfer import FlashInferMetadata
         return FlashInferMetadata(
             num_prefills=batch_size,
             num_prefill_tokens=num_tokens,
             num_decode_tokens=0,
             slot_mapping=torch.full((num_tokens,), PAD_SLOT_ID, dtype=torch.long, device=device),
-            seq_lens=seq_lens,
-            seq_lens_tensor=torch.tensor(seq_lens, dtype=torch.int, device=device),
             max_prefill_seq_len=seq_len,
-            max_decode_seq_len=0,
-            query_start_loc=seq_start_loc.clone(),
             seq_start_loc=seq_start_loc,
+            multi_modal_placeholder_index_maps=None,
+            enable_kv_scales_calculation=False,
             use_cuda_graph=False,
+            is_profile_run=True,  # Use flash_attn_varlen_func path, skip prefill_wrapper
         )
     else:
         # Default to FlashAttention (FLASH_ATTN, VLLM_FLASH_ATTN, etc.)
@@ -146,6 +147,7 @@ def poc_forward_batch(
     hidden_size: int,
     r_target: float,
     vllm_config,  # Kept for API compatibility, but we use worker.vllm_config
+    return_vectors: bool = False,
 ) -> Optional[Dict[str, Any]]:
     device = worker.device
     dtype = worker.model_runner.model_config.dtype
@@ -213,10 +215,13 @@ def poc_forward_batch(
     target = target / (target.norm() + 1e-8)
     distances = (yk - target.unsqueeze(0)).norm(dim=-1)
     
-    return {
+    result = {
         "nonces": nonces,
         "distances": distances.cpu().tolist(),
     }
+    if return_vectors:
+        result["vectors"] = yk.cpu().tolist()
+    return result
 
 
 @torch.inference_mode()
@@ -229,10 +234,12 @@ def poc_validate_batch(
     hidden_size: int,
     r_target: float,
     vllm_config,
+    return_vectors: bool = False,
 ) -> Optional[Dict[str, Any]]:
     result = poc_forward_batch(
         worker, block_hash, public_key, nonces,
         seq_len, hidden_size, r_target, vllm_config,
+        return_vectors=return_vectors,
     )
     
     if result is None:

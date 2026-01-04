@@ -1039,8 +1039,9 @@ class FlashInferImpl(AttentionImpl):
             # We will use flash attention for prefill
             # when kv_cache is not provided.
             # This happens when vllm runs the profiling to
-            # determine the number of blocks.
-            if kv_cache.numel() == 0:
+            # determine the number of blocks, or during PoC forward
+            # where we don't need to use the KV cache.
+            if kv_cache.numel() == 0 or prefill_meta.is_profile_run:
                 prefill_output = flash_attn_varlen_func(
                     q=query,
                     k=key,
