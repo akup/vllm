@@ -227,6 +227,7 @@ class PoCManager:
         public_key: str,
         r_target: float,
         seq_len: int,
+        return_vectors: bool = False,
     ) -> Dict[str, Any]:
         """Generate distances for specific nonces (cached hooks for performance)."""
         from .worker_ops import poc_forward_batch, poc_setup_layer_hooks
@@ -249,6 +250,7 @@ class PoCManager:
                 self.model_config.get_hidden_size(),
                 r_target,
                 self.vllm_config,
+                return_vectors,
             ),
         )
         
@@ -256,10 +258,13 @@ class PoCManager:
         if result is None:
             return {"nonces": nonces, "distances": []}
         
-        return {
+        response = {
             "nonces": result["nonces"],
             "distances": result["distances"],
         }
+        if return_vectors and "vectors" in result:
+            response["vectors"] = result["vectors"]
+        return response
     
     def teardown_generate_hooks(self) -> None:
         """Teardown cached hooks from generate_for_nonces."""

@@ -370,6 +370,7 @@ class MQLLMEngine:
                     result=result,
                 ))
         except Exception as e:
+            logger.error(f"PoC request failed: action={request.action}, error={e}")
             self._send_outputs(
                 RPCPoCResponse(
                     request_id=request.request_id,
@@ -440,6 +441,7 @@ class MQLLMEngine:
                 public_key=payload.get("public_key", ""),
                 r_target=payload.get("r_target", 0.5),
                 seq_len=payload.get("seq_len", 256),
+                return_vectors=payload.get("return_vectors", False),
             )
 
         elif action == "teardown_generate_hooks":
