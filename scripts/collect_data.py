@@ -23,7 +23,7 @@ def api_call(url: str, endpoint: str, method: str = "POST", json_data: dict = No
     if method == "GET":
         r = requests.get(full_url, timeout=30)
     else:
-        r = requests.post(full_url, json=json_data, timeout=300)
+        r = requests.post(full_url, json=json_data, timeout=600)
     r.raise_for_status()
     return r.json()
 
