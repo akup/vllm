@@ -320,7 +320,7 @@ class TestPoCManagerBatch:
         return PoCManager(mock_executor, MockModelConfig(), mock_vllm_config)
     
     def test_run_batch_calls_collective_rpc(self, manager, mock_executor):
-        """run_batch should call collective_rpc with poc_forward_batch."""
+        """run_batch should call collective_rpc with execute_poc_forward."""
         config = PoCConfig(
             block_hash="test_hash",
             block_height=100,
@@ -334,12 +334,12 @@ class TestPoCManagerBatch:
         
         batch = manager.run_batch()
         
-        # Verify collective_rpc was called (once for layer hooks, once for forward batch)
-        assert mock_executor.collective_rpc.call_count == 2
-        # Last call should be the forward batch
-        from vllm.poc.worker_ops import poc_forward_batch
+        # Verify collective_rpc was called (once for forward)
+        assert mock_executor.collective_rpc.call_count == 1
+        # Call should be execute_poc_forward
+        from vllm.poc.poc_model_runner import execute_poc_forward
         last_call = mock_executor.collective_rpc.call_args_list[-1]
-        assert last_call[0][0] == poc_forward_batch
+        assert last_call[0][0] == execute_poc_forward
         
         # Verify batch data
         assert batch.nonces == [0, 1, 2, 3]
@@ -460,13 +460,12 @@ class TestPoCManagerValidate:
         return PoCManager(mock_executor, MockModelConfig(), mock_vllm_config)
     
     def test_validate_calls_collective_rpc(self, manager, mock_executor):
-        """validate should call collective_rpc with poc_validate_batch."""
+        """validate should call collective_rpc with execute_poc_forward."""
         mock_executor.collective_rpc.return_value = [
             None,
             {
                 "nonces": [0, 1, 2],
                 "distances": [0.1, 0.6, 0.2],
-                "valid": [True, False, True],
             }
         ]
         
@@ -481,14 +480,14 @@ class TestPoCManagerValidate:
         
         result = manager.validate([0, 1, 2], "test_node")
         
-        # Verify collective_rpc was called (once for layer hooks, once for validate batch)
-        assert mock_executor.collective_rpc.call_count == 2
-        # Last call should be the validate batch
-        from vllm.poc.worker_ops import poc_validate_batch
+        # Verify collective_rpc was called (once for forward)
+        assert mock_executor.collective_rpc.call_count == 1
+        # Call should be execute_poc_forward
+        from vllm.poc.poc_model_runner import execute_poc_forward
         last_call = mock_executor.collective_rpc.call_args_list[-1]
-        assert last_call[0][0] == poc_validate_batch
+        assert last_call[0][0] == execute_poc_forward
         
-        # Verify results (validate returns dict with computed_distances and valid)
+        # Verify results (validate computes valid flags from distances)
         assert result["computed_distances"] == [0.1, 0.6, 0.2]
         assert result["valid"] == [True, False, True]
     

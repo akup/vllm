@@ -45,7 +45,6 @@ class PoCManager:
         self.valid_nonces: List[int] = []
         self.valid_distances: List[float] = []
         self._nonce_counter = 0
-        self._generate_block_hash: Optional[str] = None
     
     def _get_device(self) -> torch.device:
         if hasattr(self.model_executor, 'driver_worker'):
@@ -62,29 +61,6 @@ class PoCManager:
         self.valid_distances = []
         self._nonce_counter = config.node_id
         self.state = PoCState.IDLE
-        
-        # self._setup_layer_hooks()
-    
-    def _setup_layer_hooks(self) -> None:
-        pass
-        # from .worker_ops import poc_setup_layer_hooks
-        
-        # self.model_executor.collective_rpc(
-        #     poc_setup_layer_hooks,
-        #     args=(
-        #         self.config.block_hash,
-        #         self.model_config.get_hidden_size(),
-        #     ),
-        # )
-    
-    def _teardown_layer_hooks(self) -> None:
-        pass
-        # from .worker_ops import poc_teardown_layer_hooks
-        
-        # self.model_executor.collective_rpc(
-        #     poc_teardown_layer_hooks,
-        #     args=(),
-        # )
     
     def start_generate(self) -> None:
         if self.config is None:
@@ -98,8 +74,6 @@ class PoCManager:
     
     def stop_round(self) -> None:
         self.state = PoCState.STOPPED
-        if self.config is not None:
-            self._teardown_layer_hooks()
     
     def get_next_nonces(self) -> List[int]:
         nonces = []
@@ -108,28 +82,47 @@ class PoCManager:
             self._nonce_counter += self.config.node_count
         return nonces
     
+    def _run_forward(
+        self,
+        block_hash: str,
+        public_key: str,
+        nonces: List[int],
+        seq_len: int,
+        return_vectors: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Run forward pass via collective_rpc."""
+        from .poc_model_runner import execute_poc_forward
+        
+        results = self.model_executor.collective_rpc(
+            execute_poc_forward,
+            args=(
+                block_hash,
+                public_key,
+                nonces,
+                seq_len,
+                self.model_config.get_hidden_size(),
+                self.config.r_target if self.config else 1.5,
+                self.vllm_config,
+                return_vectors,
+            ),
+        )
+        
+        # Only the last PP rank returns a result
+        return next((r for r in results if r is not None), None)
+    
     def run_batch(self) -> ProofBatch:
         if self.state != PoCState.GENERATING:
             return ProofBatch.empty()
         
-        from .worker_ops import poc_forward_batch
-        
         nonces = self.get_next_nonces()
         
-        results = self.model_executor.collective_rpc(
-            poc_forward_batch,
-            args=(
-                self.config.block_hash,
-                self.config.public_key,
-                nonces,
-                self.config.seq_len,
-                self.model_config.get_hidden_size(),
-                self.config.r_target,
-                self.vllm_config,
-            ),
+        result = self._run_forward(
+            self.config.block_hash,
+            self.config.public_key,
+            nonces,
+            self.config.seq_len,
         )
         
-        result = next((r for r in results if r is not None), None)
         if result is None:
             return ProofBatch.empty()
         
@@ -179,27 +172,18 @@ class PoCManager:
         if self.config is None:
             raise RuntimeError("No round configured")
         
-        from .worker_ops import poc_validate_batch
-        
-        results = self.model_executor.collective_rpc(
-            poc_validate_batch,
-            args=(
-                self.config.block_hash,
-                public_key,
-                nonces,
-                self.config.seq_len,
-                self.model_config.get_hidden_size(),
-                self.config.r_target,
-                self.vllm_config,
-            ),
+        result = self._run_forward(
+            self.config.block_hash,
+            public_key,
+            nonces,
+            self.config.seq_len,
         )
         
-        result = next((r for r in results if r is not None), None)
         if result is None:
             raise RuntimeError("No result from validation")
         
         computed_dist = result["distances"]
-        valid_flags = result["valid"]
+        valid_flags = [d < self.config.r_target for d in computed_dist]
         
         self.stats.total_checked += len(nonces)
         self.stats.total_valid += sum(valid_flags)
@@ -231,32 +215,24 @@ class PoCManager:
         seq_len: int,
         return_vectors: bool = False,
     ) -> Dict[str, Any]:
-        """Generate distances for specific nonces (cached hooks for performance)."""
-        from .worker_ops import poc_forward_batch, poc_setup_layer_hooks
+        """Generate distances for specific nonces."""
+        # Temporarily set r_target for this call
+        old_r_target = self.config.r_target if self.config else None
+        if self.config:
+            self.config.r_target = r_target
         
-        # Only setup hooks if block_hash changed (avoid overhead)
-        if self._generate_block_hash != block_hash:
-            self.model_executor.collective_rpc(
-                poc_setup_layer_hooks,
-                args=(block_hash, self.model_config.get_hidden_size()),
-            )
-            self._generate_block_hash = block_hash
-        
-        results = self.model_executor.collective_rpc(
-            poc_forward_batch,
-            args=(
-                block_hash,
-                public_key,
-                nonces,
-                seq_len,
-                self.model_config.get_hidden_size(),
-                r_target,
-                self.vllm_config,
-                return_vectors,
-            ),
+        result = self._run_forward(
+            block_hash,
+            public_key,
+            nonces,
+            seq_len,
+            return_vectors,
         )
         
-        result = next((r for r in results if r is not None), None)
+        # Restore r_target
+        if self.config and old_r_target is not None:
+            self.config.r_target = old_r_target
+        
         if result is None:
             return {"nonces": nonces, "distances": []}
         
@@ -269,10 +245,8 @@ class PoCManager:
         return response
     
     def teardown_generate_hooks(self) -> None:
-        """Teardown cached hooks from generate_for_nonces."""
-        if self._generate_block_hash is not None:
-            self._teardown_layer_hooks()
-            self._generate_block_hash = None
+        """No-op, kept for API compatibility."""
+        pass
     
     def get_status(self) -> dict:
         return {

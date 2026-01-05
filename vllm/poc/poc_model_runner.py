@@ -1,15 +1,19 @@
-"""PoC worker operations - callables for collective_rpc.
+"""PoC model runner - simplified forward pass.
 
-These functions follow the same execution patterns as Worker.execute_model()
-for proper tensor parallel (TP) and pipeline parallel (PP) support.
+This mimics vLLM's /chat/completion TP synchronization:
+- TP rank0 (driver) broadcasts metadata to all TP workers
+- Non-driver TP workers block until they receive the broadcast
+- All TP ranks then enter model forward together (NCCL collectives align)
 """
 import torch
+import torch.distributed as dist
 from typing import List, Optional, Dict, Any
 
-from vllm.distributed import get_pp_group, get_tp_group
-from vllm.sequence import IntermediateTensors
-from vllm.forward_context import set_forward_context
 from vllm.attention.backends.utils import PAD_SLOT_ID
+from vllm.distributed import get_pp_group, get_tp_group
+from vllm.distributed.communication_op import broadcast_tensor_dict
+from vllm.forward_context import set_forward_context
+from vllm.sequence import IntermediateTensors
 
 from .gpu_random import (
     generate_inputs,
@@ -17,51 +21,9 @@ from .gpu_random import (
     random_pick_indices,
     generate_haar_orthogonal_matrices,
 )
-from .layer_hooks import LayerHouseholderHook
-# , poc_forward_context
 
-_layer_hooks: Optional[LayerHouseholderHook] = None
-
+# Number of dimensions to pick for distance computation
 POC_PICK_K_DIMS = 12
-
-
-def poc_setup_layer_hooks(
-    worker,
-    block_hash: str,
-    hidden_size: int,
-) -> Dict[str, Any]:
-    global _layer_hooks
-    
-    if _layer_hooks is not None:
-        _layer_hooks.detach()
-    
-    device = worker.device
-    model = worker.model_runner.model
-    
-    _layer_hooks = LayerHouseholderHook(model, block_hash, device, hidden_size)
-    
-    return {
-        "status": "ok",
-        "num_layers": _layer_hooks.num_layers,
-        "block_hash": block_hash,
-    }
-
-
-def poc_teardown_layer_hooks(
-    worker,
-) -> Dict[str, Any]:
-    global _layer_hooks
-    
-    num_removed = 0
-    if _layer_hooks is not None:
-        num_removed = _layer_hooks.num_layers
-        _layer_hooks.detach()
-        _layer_hooks = None
-    
-    return {
-        "status": "ok",
-        "num_removed": num_removed,
-    }
 
 
 def _create_prefill_attn_metadata(
@@ -70,7 +32,10 @@ def _create_prefill_attn_metadata(
     device: torch.device,
     attn_backend,
 ):
-    """Create prefill attention metadata for the given backend."""
+    """Create prefill attention metadata for the given backend.
+    
+    Uses PAD_SLOT_ID for all slots to skip KV cache writes.
+    """
     num_tokens = batch_size * seq_len
     seq_lens = [seq_len] * batch_size
     
@@ -101,8 +66,6 @@ def _create_prefill_attn_metadata(
             enable_kv_scales_calculation=False,
         )
     elif backend_name == "FLASHINFER":
-        # FlashInfer uses flash_attn_varlen_func when is_profile_run=True,
-        # which is what we want for PoC since we don't use KV cache.
         from vllm.attention.backends.flashinfer import FlashInferMetadata
         return FlashInferMetadata(
             num_prefills=batch_size,
@@ -114,10 +77,10 @@ def _create_prefill_attn_metadata(
             multi_modal_placeholder_index_maps=None,
             enable_kv_scales_calculation=False,
             use_cuda_graph=False,
-            is_profile_run=True,  # Use flash_attn_varlen_func path, skip prefill_wrapper
+            is_profile_run=True,
         )
     else:
-        # Default to FlashAttention (FLASH_ATTN, VLLM_FLASH_ATTN, etc.)
+        # Default to FlashAttention
         from vllm.attention.backends.flash_attn import FlashAttentionMetadata
         return FlashAttentionMetadata(
             num_prefills=batch_size,
@@ -139,7 +102,7 @@ def _create_prefill_attn_metadata(
 
 
 @torch.inference_mode()
-def poc_forward_batch(
+def execute_poc_forward(
     worker,
     block_hash: str,
     public_key: str,
@@ -147,54 +110,113 @@ def poc_forward_batch(
     seq_len: int,
     hidden_size: int,
     r_target: float,
-    vllm_config,  # Kept for API compatibility, but we use worker.vllm_config
+    vllm_config,  # Kept for API compatibility
     return_vectors: bool = False,
 ) -> Optional[Dict[str, Any]]:
+    """Execute PoC forward pass on a worker.
+    
+    Mimics /chat/completion TP synchronization:
+    - TP rank0 broadcasts PoC metadata
+    - Non-driver ranks block until broadcast received
+    - All ranks enter forward together (NCCL ops align)
+    """
     device = worker.device
     dtype = worker.model_runner.model_config.dtype
     model = worker.model_runner.model
-    batch_size = len(nonces)
-    
-    # Use worker's vllm_config (has correct static_forward_context for PP)
     worker_vllm_config = worker.vllm_config
     
-    # Generate deterministic inputs
-    inputs_embeds = generate_inputs(
-        block_hash, public_key, nonces,
-        dim=hidden_size, seq_len=seq_len,
-        device=device, dtype=dtype,
-    )
+    tp_group = get_tp_group()
+    is_tp_driver = tp_group.rank_in_group == 0
     
+    # =========================================================================
+    # TP SYNC: Rendezvous + CPU-only gate (no NCCL)
+    # 
+    # 1. CPU barrier ensures all TP ranks have ENTERED execute_poc_forward
+    #    before driver broadcasts (prevents driver racing ahead)
+    # 2. Driver broadcasts Python values via CPU group (Gloo), non-drivers block.
+    # 
+    # This mimics /chat/completion semantics WITHOUT adding NCCL collectives
+    # that could get out-of-order with model-forward NCCL.
+    # =========================================================================
+    if tp_group.world_size > 1:
+        # Rendezvous: ensure all TP ranks have entered before broadcast
+        dist.barrier(group=tp_group.cpu_group)
+        
+        if is_tp_driver:
+            # Driver: broadcast PoC metadata (Python values only - uses CPU group)
+            broadcast_tensor_dict({
+                "poc_go": True,  # signal
+                "seq_len": seq_len,
+                "hidden_size": hidden_size,
+                "nonces": nonces,
+                "return_vectors": return_vectors,
+            }, src=0)
+        else:
+            # Non-driver: block here until driver broadcasts (like /chat/completion)
+            broadcast_data = broadcast_tensor_dict(src=0)
+            # Use broadcasted values (ensures all TP ranks have identical params)
+            seq_len = int(broadcast_data["seq_len"])
+            hidden_size = int(broadcast_data["hidden_size"])
+            nonces = list(broadcast_data["nonces"])
+            return_vectors = bool(broadcast_data["return_vectors"])
+    
+    batch_size = len(nonces)
+    
+    # Generate embeddings on first PP rank, receive intermediate tensors on others
+    intermediate_tensors = None
+    inputs_embeds = None
+    
+    pp_group = get_pp_group()
+    
+    if pp_group.is_first_rank:
+        # Generate deterministic inputs on GPU (all TP ranks do this with same params)
+        inputs_embeds = generate_inputs(
+            block_hash, public_key, nonces,
+            dim=hidden_size, seq_len=seq_len,
+            device=device, dtype=dtype,
+        )
+    else:
+        # Receive from previous PP rank
+        intermediate_tensors = IntermediateTensors(
+            pp_group.recv_tensor_dict(all_gather_group=get_tp_group())
+        )
+    
+    # Create attention metadata and positions
     positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
     attn_backend = worker.model_runner.attn_backend
     attn_metadata = _create_prefill_attn_metadata(batch_size, seq_len, device, attn_backend)
     
-    # PP: receive from previous rank
-    intermediate_tensors = None
-    if not get_pp_group().is_first_rank:
-        intermediate_tensors = IntermediateTensors(
-            get_pp_group().recv_tensor_dict(all_gather_group=get_tp_group())
-        )
+    # =========================================================================
+    # TP SYNC: Pre-forward rendezvous (after PP recv, before model forward)
+    # 
+    # Ensures all TP ranks in this PP stage enter model forward together.
+    # For PP stage 0: all ranks finished generate_inputs
+    # For PP stage >0: all ranks finished recv_tensor_dict
+    # =========================================================================
+    if tp_group.world_size > 1:
+        dist.barrier(group=tp_group.cpu_group)
     
-    # Forward pass with PoC context active (hooks will transform)
-    # with poc_forward_context():
+    # Sync GPU before forward to ensure all CUDA ops complete
+    torch.cuda.synchronize()
+    
+    # Forward pass - all TP ranks now enter together
     with set_forward_context(attn_metadata, worker_vllm_config):
         hidden_states = model(
             input_ids=None,
             positions=positions.flatten(),
             intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds.view(-1, hidden_size),
+            inputs_embeds=inputs_embeds.view(-1, hidden_size) if inputs_embeds is not None else None,
         )
     
-    # PP: send to next rank
-    if not get_pp_group().is_last_rank:
+    # PP: send to next rank if not last
+    if not pp_group.is_last_rank:
         if isinstance(hidden_states, IntermediateTensors):
-            get_pp_group().send_tensor_dict(
+            pp_group.send_tensor_dict(
                 hidden_states.tensors, all_gather_group=get_tp_group()
             )
         return None
     
-    # Extract last hidden state
+    # Extract last token hidden state
     hidden_states = hidden_states.view(batch_size, seq_len, -1)
     last_hidden = hidden_states[:, -1, :].float()
     
@@ -208,13 +230,13 @@ def poc_forward_batch(
     Q = generate_haar_orthogonal_matrices(block_hash, public_key, nonces, POC_PICK_K_DIMS, device, dtype=xk.dtype)
     yk = torch.bmm(Q, xk.unsqueeze(-1)).squeeze(-1)
     
-    # Target in k-dim space (shared across all nonces)
+    # Target in k-dim space (per-nonce)
     target = generate_target(block_hash, public_key, POC_PICK_K_DIMS, device)
     
     # Normalize and compute distances
     yk = yk / (yk.norm(dim=-1, keepdim=True) + 1e-8)
-    target = target / (target.norm() + 1e-8)
-    distances = (yk - target.unsqueeze(0)).norm(dim=-1)
+    target = target / (target.norm(dim=-1, keepdim=True) + 1e-8)
+    distances = (yk - target).norm(dim=-1)
     
     result = {
         "nonces": nonces,
@@ -222,29 +244,5 @@ def poc_forward_batch(
     }
     if return_vectors:
         result["vectors"] = yk.cpu().tolist()
-    return result
-
-
-@torch.inference_mode()
-def poc_validate_batch(
-    worker,
-    block_hash: str,
-    public_key: str,
-    nonces: List[int],
-    seq_len: int,
-    hidden_size: int,
-    r_target: float,
-    vllm_config,
-    return_vectors: bool = False,
-) -> Optional[Dict[str, Any]]:
-    result = poc_forward_batch(
-        worker, block_hash, public_key, nonces,
-        seq_len, hidden_size, r_target, vllm_config,
-        return_vectors=return_vectors,
-    )
     
-    if result is None:
-        return None
-    
-    result["valid"] = [d < r_target for d in result["distances"]]
     return result
