@@ -15,10 +15,12 @@ Usage:
 import argparse
 import itertools
 import json
+import os
 import shutil
 import signal
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -27,16 +29,35 @@ import requests
 
 # Global shutdown event for Ctrl-C handling
 shutdown_event = threading.Event()
+_sigint_count = 0
+_sigint_lock = threading.Lock()
 
 
 def signal_handler(signum, frame):
-    """Handle Ctrl-C by setting shutdown event."""
-    print("\n\nInterrupt received, shutting down...")
+    """Handle Ctrl-C by initiating shutdown; force-exit on repeated Ctrl-C.
+
+    Notes:
+    - Worker threads may be blocked in long `requests` calls and cannot be
+      interrupted safely. We therefore support a second Ctrl-C to force-exit
+      the process.
+    """
+    global _sigint_count
+    with _sigint_lock:
+        _sigint_count += 1
+        count = _sigint_count
+
     shutdown_event.set()
+    if count == 1:
+        print("\n\nInterrupt received, shutting down... (press Ctrl-C again to force exit)")
+    else:
+        print("\n\nSecond interrupt received, forcing exit now.")
+        os._exit(130)
 
 
 def api_call(url: str, endpoint: str, method: str = "POST", json_data: dict = None) -> dict:
     """Make API call to server."""
+    if shutdown_event.is_set():
+        raise RuntimeError("Cancelled")
     full_url = f"{url}{endpoint}"
     if method == "GET":
         r = requests.get(full_url, timeout=30)
@@ -241,23 +262,35 @@ def main():
     interrupted = False
     try:
         with ThreadPoolExecutor(max_workers=len(url_to_tasks)) as executor:
-            futures = {
-                executor.submit(collect_all_seeds_for_url, url, task_list): url
+            futures = [
+                executor.submit(collect_all_seeds_for_url, url, task_list)
                 for url, task_list in url_to_tasks.items()
-            }
-            
-            for future in as_completed(futures):
+            ]
+
+            # Avoid blocking indefinitely in `as_completed()` so Ctrl-C is responsive.
+            pending = set(futures)
+            while pending:
                 if shutdown_event.is_set():
                     interrupted = True
+                    # Best-effort: cancel tasks that haven't started yet.
+                    for f in list(pending):
+                        f.cancel()
                     break
-                    
-                url, results = future.result()
-                for name, block_hash, public_key, nonce_count, vector_count, error in results:
-                    seed_str = f" [{block_hash}+{public_key}]" if multi_seed else ""
-                    if error:
-                        print(f"{name}{seed_str}: FAILED - {error}")
-                    else:
-                        print(f"{name}{seed_str}: OK ({nonce_count} nonces, {vector_count} vectors)")
+
+                done_now = {f for f in pending if f.done()}
+                if not done_now:
+                    time.sleep(0.1)
+                    continue
+
+                for future in done_now:
+                    pending.remove(future)
+                    url, results = future.result()
+                    for name, block_hash, public_key, nonce_count, vector_count, error in results:
+                        seed_str = f" [{block_hash}+{public_key}]" if multi_seed else ""
+                        if error:
+                            print(f"{name}{seed_str}: FAILED - {error}")
+                        else:
+                            print(f"{name}{seed_str}: OK ({nonce_count} nonces, {vector_count} vectors)")
     except KeyboardInterrupt:
         interrupted = True
         shutdown_event.set()

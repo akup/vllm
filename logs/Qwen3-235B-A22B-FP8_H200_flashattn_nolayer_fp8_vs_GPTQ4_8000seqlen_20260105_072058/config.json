@@ -9,7 +9,7 @@
   "public_key": "test_nodesdcdcdsdcsdc",
   "r_target": 1.9337684,
   "nonce_count": 1000,
-  "batch_size": 10,
-  "seq_len": 7000
+  "batch_size": 32,
+  "seq_len": 8000
 }
 

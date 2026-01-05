@@ -1,7 +1,0 @@
-{
-  "server_name": "server_134_1_fp8_tp4",
-  "server_url": "http://204.12.162.134:8000",
-  "block_hash": "sdcslncdjkfnvhbjhb",
-  "public_key": "test_nodesdcdcdsdcsdc",
-  "error": "HTTPConnectionPool(host='204.12.162.134', port=8000): Read timed out. (read timeout=600)"
-}
