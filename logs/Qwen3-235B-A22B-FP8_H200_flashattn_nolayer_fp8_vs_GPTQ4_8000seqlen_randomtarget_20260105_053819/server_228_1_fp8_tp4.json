@@ -1,0 +1,7 @@
+{
+  "server_name": "server_228_1_fp8_tp4",
+  "server_url": "http://66.201.4.228:8000",
+  "block_hash": "sdcslncdjkfnvhbjhb",
+  "public_key": "test_nodesdcdcdsdcsdc",
+  "error": "('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))"
+}

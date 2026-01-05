@@ -1,0 +1,7 @@
+{
+  "server_name": "server_228_1_gptqint4_tp4",
+  "server_url": "http://66.201.4.228:8001",
+  "block_hash": "sdcslncdjkfnvhbjhb",
+  "public_key": "test_nodesdcdcdsdcsdc",
+  "error": "HTTPConnectionPool(host='66.201.4.228', port=8001): Read timed out. (read timeout=600)"
+}
