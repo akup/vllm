@@ -19,7 +19,7 @@ from .gpu_random import (
     generate_inputs,
     generate_target,
     random_pick_indices,
-    generate_haar_orthogonal_matrices,
+    apply_haar_rotation,
 )
 
 # Default k_dim (can be overridden per-request)
@@ -207,12 +207,10 @@ def execute_poc_forward(
     # Normalize to unit sphere
     last_hidden = last_hidden / (last_hidden.norm(dim=-1, keepdim=True) + 1e-8)
     
-    # Per-nonce k-dim pick + Haar rotation
+    # Per-nonce k-dim pick + Haar rotation (via Householder chain, no cuSOLVER)
     indices = random_pick_indices(block_hash, public_key, nonces, hidden_size, k_dim, device)
     xk = torch.gather(last_hidden, 1, indices)
-    
-    Q = generate_haar_orthogonal_matrices(block_hash, public_key, nonces, k_dim, device, dtype=xk.dtype)
-    yk = torch.bmm(Q, xk.unsqueeze(-1)).squeeze(-1)
+    yk = apply_haar_rotation(block_hash, public_key, nonces, xk, device)
     
     # Normalize output vectors
     yk = yk / (yk.norm(dim=-1, keepdim=True) + 1e-8)
