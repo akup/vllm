@@ -1,5 +1,16 @@
 from .config import PoCConfig, PoCState
-from .data import ProofBatch, ValidatedBatch
+from .data import (
+    PoCParams,
+    Artifact,
+    Encoding,
+    ArtifactBatch,
+    ValidationResult,
+    encode_vector,
+    decode_vector,
+    is_mismatch,
+    fraud_test,
+    compare_artifacts,
+)
 from .manager import PoCManager, PoCStats
 from .routes import router as poc_router
 from .layer_hooks import LayerHouseholderHook
@@ -7,11 +18,18 @@ from .layer_hooks import LayerHouseholderHook
 __all__ = [
     "PoCConfig",
     "PoCState",
-    "ProofBatch",
-    "ValidatedBatch",
+    "PoCParams",
+    "Artifact",
+    "Encoding",
+    "ArtifactBatch",
+    "ValidationResult",
+    "encode_vector",
+    "decode_vector",
+    "is_mismatch",
+    "fraud_test",
+    "compare_artifacts",
     "PoCManager",
     "PoCStats",
     "poc_router",
     "LayerHouseholderHook",
 ]
-

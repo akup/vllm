@@ -1,4 +1,4 @@
-FROM vllm-openai
+FROM ghcr.io/gonka-ai/vllm:v0.9.1-blackwell
 
 ENV VLLM_USE_V1=0
 

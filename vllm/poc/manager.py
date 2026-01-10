@@ -1,10 +1,11 @@
+"""PoC Manager - handles artifact generation for proof of compute."""
 import time
-import torch
+import numpy as np
 from typing import Optional, List, Dict, Any, TYPE_CHECKING
 from dataclasses import dataclass
 
 from .config import PoCConfig, PoCState
-from .data import ProofBatch
+from .data import Artifact, encode_vector
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -13,8 +14,8 @@ if TYPE_CHECKING:
 
 @dataclass
 class PoCStats:
-    total_checked: int = 0
-    total_valid: int = 0
+    """Statistics for PoC generation."""
+    total_processed: int = 0
     start_time: float = 0.0
     
     @property
@@ -22,11 +23,13 @@ class PoCStats:
         return time.time() - self.start_time if self.start_time > 0 else 0.0
     
     @property
-    def rate(self) -> float:
-        return self.total_checked / self.elapsed if self.elapsed > 0 else 0.0
+    def nonces_per_second(self) -> float:
+        return self.total_processed / self.elapsed if self.elapsed > 0 else 0.0
 
 
 class PoCManager:
+    """Manages PoC artifact generation."""
+    
     def __init__(
         self,
         model_executor: "ExecutorBase",
@@ -36,46 +39,34 @@ class PoCManager:
         self.model_executor = model_executor
         self.model_config = model_config
         self.vllm_config = vllm_config
-        self.device = self._get_device()
         
         self.state = PoCState.IDLE
         self.config: Optional[PoCConfig] = None
         self.stats = PoCStats()
-        
-        self.valid_nonces: List[int] = []
-        self.valid_distances: List[float] = []
         self._nonce_counter = 0
     
-    def _get_device(self) -> torch.device:
-        if hasattr(self.model_executor, 'driver_worker'):
-            return self.model_executor.driver_worker.device
-        return torch.device("cuda:0")
-    
     def init_round(self, config: PoCConfig) -> None:
+        """Initialize a new generation round."""
         if self.state == PoCState.GENERATING:
             raise RuntimeError("Round already in progress")
         
         self.config = config
         self.stats = PoCStats(start_time=time.time())
-        self.valid_nonces = []
-        self.valid_distances = []
         self._nonce_counter = config.node_id
         self.state = PoCState.IDLE
     
     def start_generate(self) -> None:
+        """Start generating artifacts."""
         if self.config is None:
             raise RuntimeError("Round not initialized")
         self.state = PoCState.GENERATING
     
-    def start_validate(self) -> None:
-        if self.config is None:
-            raise RuntimeError("Round not initialized")
-        self.state = PoCState.VALIDATING
-    
     def stop_round(self) -> None:
+        """Stop the current round."""
         self.state = PoCState.STOPPED
     
     def get_next_nonces(self) -> List[int]:
+        """Get next batch of nonces to process."""
         nonces = []
         for _ in range(self.config.batch_size):
             nonces.append(self._nonce_counter)
@@ -88,9 +79,12 @@ class PoCManager:
         public_key: str,
         nonces: List[int],
         seq_len: int,
-        return_vectors: bool = False,
+        k_dim: int,
     ) -> Optional[Dict[str, Any]]:
-        """Run forward pass via collective_rpc."""
+        """Run forward pass via collective_rpc.
+        
+        Returns dict with 'nonces' and 'vectors' (FP16 numpy array).
+        """
         from .poc_model_runner import execute_poc_forward
         
         results = self.model_executor.collective_rpc(
@@ -101,18 +95,24 @@ class PoCManager:
                 nonces,
                 seq_len,
                 self.model_config.get_hidden_size(),
-                self.config.r_target if self.config else 1.5,
-                self.vllm_config,
-                return_vectors,
+                k_dim,
             ),
         )
         
         # Only the last PP rank returns a result
         return next((r for r in results if r is not None), None)
     
-    def run_batch(self) -> ProofBatch:
+    def run_batch(self) -> Dict[str, Any]:
+        """Run a batch and return artifacts.
+        
+        Returns:
+            Dict with 'should_continue', 'nonces', 'artifacts', and metadata.
+        """
         if self.state != PoCState.GENERATING:
-            return ProofBatch.empty()
+            return {
+                "should_continue": False,
+                "state": self.state.value,
+            }
         
         nonces = self.get_next_nonces()
         
@@ -121,38 +121,25 @@ class PoCManager:
             self.config.public_key,
             nonces,
             self.config.seq_len,
+            self.config.k_dim,
         )
         
         if result is None:
-            return ProofBatch.empty()
-        
-        batch = ProofBatch(
-            public_key=self.config.public_key,
-            block_hash=self.config.block_hash,
-            block_height=self.config.block_height,
-            nonces=result["nonces"],
-            dist=result["distances"],
-            node_id=self.config.node_id,
-        )
-        
-        self.stats.total_checked += len(nonces)
-        
-        valid_batch = batch.sub_batch(self.config.r_target)
-        self.stats.total_valid += len(valid_batch)
-        self.valid_nonces.extend(valid_batch.nonces)
-        self.valid_distances.extend(valid_batch.dist)
-        
-        return batch
-    
-    def run_batch_with_state(self) -> dict:
-        if self.state != PoCState.GENERATING:
             return {
-                "should_continue": False,
+                "should_continue": self.state == PoCState.GENERATING,
                 "state": self.state.value,
+                "nonces": [],
+                "artifacts": [],
             }
         
-        batch = self.run_batch()
-        valid_batch = batch.sub_batch(self.config.r_target)
+        # Convert vectors to artifacts
+        vectors = result["vectors"]  # FP16 numpy array [batch_size, k_dim]
+        artifacts = []
+        for i, nonce in enumerate(result["nonces"]):
+            vector_b64 = encode_vector(vectors[i])
+            artifacts.append(Artifact(nonce=nonce, vector_b64=vector_b64))
+        
+        self.stats.total_processed += len(nonces)
         
         return {
             "should_continue": self.state == PoCState.GENERATING,
@@ -161,101 +148,64 @@ class PoCManager:
             "block_hash": self.config.block_hash,
             "block_height": self.config.block_height,
             "node_id": self.config.node_id,
-            "nonces": batch.nonces,
-            "distances": batch.dist,
-            "valid_nonces": valid_batch.nonces,
-            "valid_distances": valid_batch.dist,
+            "nonces": result["nonces"],
+            "artifacts": artifacts,
         }
     
-    def validate(self, nonces: List[int], public_key: str, 
-                 received_dist: Optional[List[float]] = None) -> Dict[str, Any]:
-        if self.config is None:
-            raise RuntimeError("No round configured")
-        
-        result = self._run_forward(
-            self.config.block_hash,
-            public_key,
-            nonces,
-            self.config.seq_len,
-        )
-        
-        if result is None:
-            raise RuntimeError("No result from validation")
-        
-        computed_dist = result["distances"]
-        valid_flags = [d < self.config.r_target for d in computed_dist]
-        
-        self.stats.total_checked += len(nonces)
-        self.stats.total_valid += sum(valid_flags)
-        
-        fraud_detected = False
-        if received_dist is not None and len(received_dist) == len(computed_dist):
-            for recv, comp in zip(received_dist, computed_dist):
-                if recv < self.config.r_target and comp >= self.config.r_target:
-                    fraud_detected = True
-                    break
-        
-        return {
-            "nonces": nonces,
-            "computed_distances": computed_dist,
-            "received_distances": received_dist or [],
-            "valid": valid_flags,
-            "fraud_detected": fraud_detected,
-            "public_key": public_key,
-            "block_hash": self.config.block_hash,
-            "block_height": self.config.block_height,
-        }
-    
-    def generate_for_nonces(
+    def generate_artifacts(
         self,
         nonces: List[int],
         block_hash: str,
         public_key: str,
-        r_target: float,
         seq_len: int,
-        return_vectors: bool = False,
-    ) -> Dict[str, Any]:
-        """Generate distances for specific nonces."""
-        # Temporarily set r_target for this call
-        old_r_target = self.config.r_target if self.config else None
-        if self.config:
-            self.config.r_target = r_target
+        k_dim: int,
+    ) -> List[Artifact]:
+        """Generate artifacts for specific nonces.
         
+        Used by /generate endpoint for explicit nonce computation.
+        """
         result = self._run_forward(
             block_hash,
             public_key,
             nonces,
             seq_len,
-            return_vectors,
+            k_dim,
         )
         
-        # Restore r_target
-        if self.config and old_r_target is not None:
-            self.config.r_target = old_r_target
-        
         if result is None:
-            return {"nonces": nonces, "distances": []}
+            return []
         
-        response = {
-            "nonces": result["nonces"],
-            "distances": result["distances"],
-        }
-        if return_vectors and "vectors" in result:
-            response["vectors"] = result["vectors"]
-        return response
-    
-    def teardown_generate_hooks(self) -> None:
-        """No-op, kept for API compatibility."""
-        pass
+        vectors = result["vectors"]  # FP16 numpy array
+        artifacts = []
+        for i, nonce in enumerate(result["nonces"]):
+            vector_b64 = encode_vector(vectors[i])
+            artifacts.append(Artifact(nonce=nonce, vector_b64=vector_b64))
+        
+        self.stats.total_processed += len(nonces)
+        return artifacts
     
     def get_status(self) -> dict:
-        return {
-            "state": self.state.value,
-            "valid_nonces": self.valid_nonces,
-            "valid_distances": self.valid_distances,
-            "total_checked": self.stats.total_checked,
-            "total_valid": self.stats.total_valid,
-            "elapsed_seconds": self.stats.elapsed,
-            "rate_per_second": self.stats.rate,
-            "r_target": self.config.r_target if self.config else None,
+        """Get current PoC status."""
+        status = {
+            "status": self.state.value,
+            "stats": {
+                "total_processed": self.stats.total_processed,
+                "nonces_per_second": self.stats.nonces_per_second,
+            },
         }
+        
+        if self.config:
+            status["config"] = {
+                "block_hash": self.config.block_hash,
+                "block_height": self.config.block_height,
+                "public_key": self.config.public_key,
+                "node_id": self.config.node_id,
+                "node_count": self.config.node_count,
+                "seq_len": self.config.seq_len,
+                "k_dim": self.config.k_dim,
+            }
+        else:
+            status["config"] = None
+            status["stats"] = None
+        
+        return status

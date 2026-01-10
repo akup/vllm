@@ -22,8 +22,8 @@ from .gpu_random import (
     generate_haar_orthogonal_matrices,
 )
 
-# Number of dimensions to pick for distance computation
-POC_PICK_K_DIMS = 12
+# Default k_dim (can be overridden per-request)
+DEFAULT_K_DIM = 12
 
 
 def _create_prefill_attn_metadata(
@@ -109,9 +109,7 @@ def execute_poc_forward(
     nonces: List[int],
     seq_len: int,
     hidden_size: int,
-    r_target: float,
-    vllm_config,  # Kept for API compatibility
-    return_vectors: bool = False,
+    k_dim: int = DEFAULT_K_DIM,
 ) -> Optional[Dict[str, Any]]:
     """Execute PoC forward pass on a worker.
     
@@ -119,6 +117,10 @@ def execute_poc_forward(
     - TP rank0 broadcasts PoC metadata
     - Non-driver ranks block until broadcast received
     - All ranks enter forward together (NCCL ops align)
+    
+    Returns:
+        Dict with nonces and vectors (FP16 numpy arrays for encoding).
+        Returns None for non-last PP ranks.
     """
     device = worker.device
     dtype = worker.model_runner.model_config.dtype
@@ -130,35 +132,24 @@ def execute_poc_forward(
     
     # =========================================================================
     # TP SYNC: Rendezvous + CPU-only gate (no NCCL)
-    # 
-    # 1. CPU barrier ensures all TP ranks have ENTERED execute_poc_forward
-    #    before driver broadcasts (prevents driver racing ahead)
-    # 2. Driver broadcasts Python values via CPU group (Gloo), non-drivers block.
-    # 
-    # This mimics /chat/completion semantics WITHOUT adding NCCL collectives
-    # that could get out-of-order with model-forward NCCL.
     # =========================================================================
     if tp_group.world_size > 1:
-        # Rendezvous: ensure all TP ranks have entered before broadcast
         dist.barrier(group=tp_group.cpu_group)
         
         if is_tp_driver:
-            # Driver: broadcast PoC metadata (Python values only - uses CPU group)
             broadcast_tensor_dict({
-                "poc_go": True,  # signal
+                "poc_go": True,
                 "seq_len": seq_len,
                 "hidden_size": hidden_size,
                 "nonces": nonces,
-                "return_vectors": return_vectors,
+                "k_dim": k_dim,
             }, src=0)
         else:
-            # Non-driver: block here until driver broadcasts (like /chat/completion)
             broadcast_data = broadcast_tensor_dict(src=0)
-            # Use broadcasted values (ensures all TP ranks have identical params)
             seq_len = int(broadcast_data["seq_len"])
             hidden_size = int(broadcast_data["hidden_size"])
             nonces = list(broadcast_data["nonces"])
-            return_vectors = bool(broadcast_data["return_vectors"])
+            k_dim = int(broadcast_data["k_dim"])
     
     batch_size = len(nonces)
     
@@ -169,14 +160,12 @@ def execute_poc_forward(
     pp_group = get_pp_group()
     
     if pp_group.is_first_rank:
-        # Generate deterministic inputs on GPU (all TP ranks do this with same params)
         inputs_embeds = generate_inputs(
             block_hash, public_key, nonces,
             dim=hidden_size, seq_len=seq_len,
             device=device, dtype=dtype,
         )
     else:
-        # Receive from previous PP rank
         intermediate_tensors = IntermediateTensors(
             pp_group.recv_tensor_dict(all_gather_group=get_tp_group())
         )
@@ -187,19 +176,14 @@ def execute_poc_forward(
     attn_metadata = _create_prefill_attn_metadata(batch_size, seq_len, device, attn_backend)
     
     # =========================================================================
-    # TP SYNC: Pre-forward rendezvous (after PP recv, before model forward)
-    # 
-    # Ensures all TP ranks in this PP stage enter model forward together.
-    # For PP stage 0: all ranks finished generate_inputs
-    # For PP stage >0: all ranks finished recv_tensor_dict
+    # TP SYNC: Pre-forward rendezvous
     # =========================================================================
     if tp_group.world_size > 1:
         dist.barrier(group=tp_group.cpu_group)
     
-    # Sync GPU before forward to ensure all CUDA ops complete
     torch.cuda.synchronize()
     
-    # Forward pass - all TP ranks now enter together
+    # Forward pass
     with set_forward_context(attn_metadata, worker_vllm_config):
         hidden_states = model(
             input_ids=None,
@@ -216,7 +200,7 @@ def execute_poc_forward(
             )
         return None
     
-    # Extract last token hidden state
+    # Extract last token hidden state and compute in FP32
     hidden_states = hidden_states.view(batch_size, seq_len, -1)
     last_hidden = hidden_states[:, -1, :].float()
     
@@ -224,25 +208,19 @@ def execute_poc_forward(
     last_hidden = last_hidden / (last_hidden.norm(dim=-1, keepdim=True) + 1e-8)
     
     # Per-nonce k-dim pick + Haar rotation
-    indices = random_pick_indices(block_hash, public_key, nonces, hidden_size, POC_PICK_K_DIMS, device)
+    indices = random_pick_indices(block_hash, public_key, nonces, hidden_size, k_dim, device)
     xk = torch.gather(last_hidden, 1, indices)
     
-    Q = generate_haar_orthogonal_matrices(block_hash, public_key, nonces, POC_PICK_K_DIMS, device, dtype=xk.dtype)
+    Q = generate_haar_orthogonal_matrices(block_hash, public_key, nonces, k_dim, device, dtype=xk.dtype)
     yk = torch.bmm(Q, xk.unsqueeze(-1)).squeeze(-1)
     
-    # Target in k-dim space (per-nonce)
-    target = generate_target(block_hash, public_key, POC_PICK_K_DIMS, device)
-    
-    # Normalize and compute distances
+    # Normalize output vectors
     yk = yk / (yk.norm(dim=-1, keepdim=True) + 1e-8)
-    target = target / (target.norm(dim=-1, keepdim=True) + 1e-8)
-    distances = (yk - target).norm(dim=-1)
     
-    result = {
+    # Convert to FP16 for artifact encoding (compute was in FP32)
+    vectors_f16 = yk.half().cpu().numpy()
+    
+    return {
         "nonces": nonces,
-        "distances": distances.cpu().tolist(),
+        "vectors": vectors_f16,  # FP16 numpy array, shape [batch_size, k_dim]
     }
-    if return_vectors:
-        result["vectors"] = yk.cpu().tolist()
-    
-    return result

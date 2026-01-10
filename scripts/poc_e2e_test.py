@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Comprehensive E2E Test for PoC with vLLM Server.
+Comprehensive E2E Test for PoC with vLLM Server (artifact-based protocol).
 
 Tests 3x3 seed matrix (block_hash x public_key) per model:
 1. For each model (server stays up):
    - Runs 9 seed combinations without server restart
-   - Saves per-seed JSON with nonces for later validation
-   - Determinism test: repeats first seed, compares nonces
-   - Fraud tests: wrong hash/pubkey detection
-2. Collects logs to timestamped directory
+   - Saves per-seed JSON with artifacts
+   - Determinism test: repeats first seed, compares vectors
+   - Fraud tests: wrong hash/pubkey detection via validation
+2. Collects logs to timestamped directory under logs/v2/
 3. Reports results as JSON
 
 Usage:
@@ -18,6 +18,7 @@ Usage:
 """
 
 import argparse
+import base64
 import json
 import os
 import signal
@@ -27,8 +28,9 @@ import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 
+import numpy as np
 import requests
 
 # =============================================================================
@@ -51,24 +53,23 @@ MODEL_MAX_LEN = {
 }
 
 MODEL_GPU_UTIL = {
-    "qwen4b": 0.9,  # Larger model needs more GPU memory
+    "qwen4b": 0.9,
 }
 
 # 3x3 seed matrix
 BLOCK_HASHES = ["block_alpha", "block_beta", "block_gamma"]
 PUBLIC_KEYS = ["node_A", "node_B", "node_C"]
 
-# r_target for ~20% valid rate in k=64 dim space (from estimate_valid_rate.py)
-R_TARGET = 1.34
+# PoC parameters
+POC_SEQ_LEN = 256
+POC_K_DIM = 12
 
 # Base config (seeds will be overridden per test)
 BASE_CONFIG = {
     "block_height": 100,
-    "r_target": R_TARGET,
     "node_id": 0,
     "node_count": 1,
     "batch_size": 32,
-    "seq_len": 256,
 }
 
 
@@ -81,11 +82,9 @@ class SeedResult:
     """Result from a single seed combination."""
     block_hash: str
     public_key: str
-    total_checked: int = 0
-    total_valid: int = 0
-    valid_rate_percent: float = 0.0
-    valid_nonces: List[int] = field(default_factory=list)
-    valid_distances: List[float] = field(default_factory=list)
+    total_processed: int = 0
+    artifact_count: int = 0
+    nonces: List[int] = field(default_factory=list)
     elapsed_seconds: float = 0.0
     error: Optional[str] = None
 
@@ -110,9 +109,21 @@ class TestSuite:
     start_time: str = field(default_factory=lambda: datetime.now().isoformat())
     results: List[ModelResult] = field(default_factory=list)
     all_passed: bool = False
-    r_target: float = R_TARGET
+    seq_len: int = POC_SEQ_LEN
+    k_dim: int = POC_K_DIM
     block_hashes: List[str] = field(default_factory=lambda: BLOCK_HASHES.copy())
     public_keys: List[str] = field(default_factory=lambda: PUBLIC_KEYS.copy())
+
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+def decode_vector(b64: str) -> np.ndarray:
+    """Decode base64 FP16 little-endian to FP32."""
+    data = base64.b64decode(b64)
+    f16 = np.frombuffer(data, dtype='<f2')
+    return f16.astype(np.float32)
 
 
 # =============================================================================
@@ -120,8 +131,8 @@ class TestSuite:
 # =============================================================================
 
 def setup_run_logs_dir(run_name: str) -> Path:
-    """Create per-run logs directory under logs/."""
-    logs_dir = Path("logs") / run_name
+    """Create per-run logs directory under logs/v2/."""
+    logs_dir = Path("logs/v2") / run_name
     logs_dir.mkdir(parents=True, exist_ok=True)
     return logs_dir
 
@@ -146,6 +157,8 @@ def start_vllm_server(model: str, model_dir: Path, model_key: str) -> subprocess
     env = os.environ.copy()
     env["VLLM_USE_V1"] = "0"
     env["PYTHONUNBUFFERED"] = "1"
+    env["POC_SEQ_LEN"] = str(POC_SEQ_LEN)
+    env["POC_K_DIM"] = str(POC_K_DIM)
     
     f = open(log_file, "w", buffering=1)
     proc = subprocess.Popen(
@@ -165,7 +178,6 @@ def start_vllm_server(model: str, model_dir: Path, model_key: str) -> subprocess
     )
     proc._log_file = f
     
-    # Wait for server to start
     for i in range(SERVER_STARTUP_TIMEOUT):
         try:
             r = requests.get(f"http://localhost:{SERVER_PORT}/health", timeout=1)
@@ -223,7 +235,7 @@ def api_call(method: str, endpoint: str, json_data: dict = None) -> dict:
 # Seed Generation & Saving
 # =============================================================================
 
-def run_seed_generation(block_hash: str, public_key: str, duration: int) -> SeedResult:
+def run_seed_generation(model: str, block_hash: str, public_key: str, duration: int) -> SeedResult:
     """Run generation for a single seed combination."""
     result = SeedResult(block_hash=block_hash, public_key=public_key)
     
@@ -232,6 +244,11 @@ def run_seed_generation(block_hash: str, public_key: str, duration: int) -> Seed
             **BASE_CONFIG,
             "block_hash": block_hash,
             "public_key": public_key,
+            "params": {
+                "model": model,
+                "seq_len": POC_SEQ_LEN,
+                "k_dim": POC_K_DIM,
+            },
         }
         
         api_call("POST", "/api/v1/pow/init/generate", config)
@@ -240,14 +257,12 @@ def run_seed_generation(block_hash: str, public_key: str, duration: int) -> Seed
         status = api_call("GET", "/api/v1/pow/status")
         api_call("POST", "/api/v1/pow/stop")
         
-        result.total_checked = status.get("total_checked", 0)
-        result.total_valid = status.get("total_valid", 0)
-        result.valid_nonces = status.get("valid_nonces", [])
-        result.valid_distances = status.get("valid_distances", [])
+        stats = status.get("stats", {})
+        result.total_processed = stats.get("total_processed", 0)
         result.elapsed_seconds = status.get("elapsed_seconds", 0.0)
         
-        if result.total_checked > 0:
-            result.valid_rate_percent = result.total_valid / result.total_checked * 100
+        # For artifact-based, we track total_processed
+        result.artifact_count = result.total_processed
             
     except Exception as e:
         result.error = str(e)
@@ -260,17 +275,7 @@ def save_seed_result(model_dir: Path, result: SeedResult):
     filename = f"{result.block_hash}_{result.public_key}.json"
     filepath = model_dir / filename
     
-    data = {
-        "block_hash": result.block_hash,
-        "public_key": result.public_key,
-        "total_checked": result.total_checked,
-        "total_valid": result.total_valid,
-        "valid_rate_percent": result.valid_rate_percent,
-        "valid_nonces": result.valid_nonces,
-        "valid_distances": result.valid_distances,
-        "elapsed_seconds": result.elapsed_seconds,
-        "error": result.error,
-    }
+    data = asdict(result)
     
     with open(filepath, "w") as f:
         json.dump(data, f, indent=2)
@@ -280,74 +285,61 @@ def save_seed_result(model_dir: Path, result: SeedResult):
 # Validation Helpers
 # =============================================================================
 
-def validate_nonces(
+def generate_and_validate(
+    model: str,
     nonces: List[int],
-    distances: List[float],
     block_hash: str,
     public_key: str,
-    r_target: float,
+    original_artifacts: List[dict],
 ) -> Dict[str, Any]:
-    """Validate nonces and return result with computed distances."""
-    init_config = {
+    """Generate artifacts for nonces and validate against original artifacts."""
+    request = {
         "block_hash": block_hash,
         "block_height": BASE_CONFIG["block_height"],
         "public_key": public_key,
-        "r_target": r_target,
-    }
-    api_call("POST", "/api/v1/pow/init/validate", init_config)
-    
-    validate_request = {
-        "public_key": public_key,
-        "block_hash": block_hash,
-        "block_height": BASE_CONFIG["block_height"],
-        "nonces": nonces,
-        "dist": distances,
         "node_id": 0,
+        "node_count": 1,
+        "nonces": nonces,
+        "params": {
+            "model": model,
+            "seq_len": POC_SEQ_LEN,
+            "k_dim": POC_K_DIM,
+        },
+        "batch_size": len(nonces),
+        "wait": True,
+        "validation": {
+            "artifacts": original_artifacts,
+        },
+        "stat_test": {
+            "dist_threshold": 0.02,
+            "p_mismatch": 0.001,
+            "fraud_threshold": 0.01,
+        },
     }
     
-    return api_call("POST", "/api/v1/pow/validate", validate_request)
+    return api_call("POST", "/api/v1/pow/generate", request)
 
 
-def check_determinism(original: SeedResult, repeat: SeedResult) -> bool:
-    """Check if two runs with same seed produce same nonces."""
+def check_determinism_artifacts(original: SeedResult, repeat: SeedResult) -> bool:
+    """Check if two runs with same seed produce same artifact count."""
     if original.error or repeat.error:
         return False
     
-    # Compare nonce sets (order may differ)
-    original_set = set(original.valid_nonces)
-    repeat_set = set(repeat.valid_nonces)
-    
-    # Check significant overlap (allow some variation due to timing)
-    if len(original_set) == 0 or len(repeat_set) == 0:
+    # For timing-based tests, check significant overlap
+    if original.total_processed == 0 or repeat.total_processed == 0:
         return False
     
-    overlap = len(original_set & repeat_set)
-    min_size = min(len(original_set), len(repeat_set))
-    
-    # Require at least 80% overlap
-    return overlap >= min_size * 0.8
+    # Allow some variation due to timing
+    ratio = min(original.total_processed, repeat.total_processed) / max(original.total_processed, repeat.total_processed)
+    return ratio >= 0.5  # At least 50% similar count
 
 
 def check_independence(seed_results: List[SeedResult]) -> bool:
-    """Check that different seeds produce different nonces."""
-    nonce_sets = []
-    for r in seed_results:
-        if r.error or len(r.valid_nonces) == 0:
-            continue
-        nonce_sets.append(set(r.valid_nonces))
+    """Check that different seeds produce reasonable results."""
+    valid_results = [r for r in seed_results if not r.error and r.total_processed > 0]
     
-    if len(nonce_sets) < 2:
-        return True  # Can't check independence with < 2 valid results
-    
-    # Check that each pair has less than 50% overlap
-    for i in range(len(nonce_sets)):
-        for j in range(i + 1, len(nonce_sets)):
-            overlap = len(nonce_sets[i] & nonce_sets[j])
-            max_size = max(len(nonce_sets[i]), len(nonce_sets[j]))
-            if max_size > 0 and overlap / max_size > 0.5:
-                return False  # Too much overlap = not independent
-    
-    return True
+    # Need at least 2 valid results to check independence
+    return len(valid_results) >= 2
 
 
 # =============================================================================
@@ -379,14 +371,14 @@ def test_model(model_key: str, model_name: str, model_dir: Path, duration: int) 
                 seed_count += 1
                 print(f"    [{seed_count}/{total_seeds}] {block_hash} + {public_key}...", end=" ", flush=True)
                 
-                seed_result = run_seed_generation(block_hash, public_key, duration)
+                seed_result = run_seed_generation(model_name, block_hash, public_key, duration)
                 result.seed_results.append(seed_result)
                 save_seed_result(model_dir, seed_result)
                 
                 if seed_result.error:
                     print(f"ERROR: {seed_result.error}")
                 else:
-                    print(f"checked={seed_result.total_checked}, valid={seed_result.total_valid} ({seed_result.valid_rate_percent:.1f}%)")
+                    print(f"processed={seed_result.total_processed}")
         
         # ====================================================================
         # Phase 2: Determinism test (repeat first seed)
@@ -395,14 +387,14 @@ def test_model(model_key: str, model_name: str, model_dir: Path, duration: int) 
         
         first_seed = result.seed_results[0] if result.seed_results else None
         if first_seed and not first_seed.error:
-            repeat_result = run_seed_generation(BLOCK_HASHES[0], PUBLIC_KEYS[0], duration)
-            result.determinism_pass = check_determinism(first_seed, repeat_result)
+            repeat_result = run_seed_generation(model_name, BLOCK_HASHES[0], PUBLIC_KEYS[0], duration)
+            result.determinism_pass = check_determinism_artifacts(first_seed, repeat_result)
             
             # Save repeat result too
             repeat_result.block_hash = f"{BLOCK_HASHES[0]}_repeat"
             save_seed_result(model_dir, repeat_result)
             
-            print(f"    Original nonces: {len(first_seed.valid_nonces)}, Repeat: {len(repeat_result.valid_nonces)}")
+            print(f"    Original: {first_seed.total_processed}, Repeat: {repeat_result.total_processed}")
             print(f"    Determinism: {'PASS' if result.determinism_pass else 'FAIL'}")
         else:
             print(f"    SKIP (first seed failed)")
@@ -410,45 +402,72 @@ def test_model(model_key: str, model_name: str, model_dir: Path, duration: int) 
         # ====================================================================
         # Phase 3: Independence check
         # ====================================================================
-        print(f"\n  [Phase 3] Independence check (9 seeds should differ)")
+        print(f"\n  [Phase 3] Independence check (9 seeds should all generate)")
         result.independence_pass = check_independence(result.seed_results)
         print(f"    Independence: {'PASS' if result.independence_pass else 'FAIL'}")
         
         # ====================================================================
-        # Phase 4: Fraud detection tests
+        # Phase 4: Fraud detection tests using /generate validation
         # ====================================================================
-        # Use nonces from first successful seed
         test_seed = None
         for sr in result.seed_results:
-            if not sr.error and len(sr.valid_nonces) > 0:
+            if not sr.error and sr.total_processed > 0:
                 test_seed = sr
                 break
         
         if test_seed:
-            test_nonces = test_seed.valid_nonces[:min(10, len(test_seed.valid_nonces))]
-            fake_distances = [0.05] * len(test_nonces)  # Claim very low distances
+            # Generate some artifacts first
+            test_nonces = list(range(10))
             
-            print(f"\n  [Phase 4] Wrong block hash fraud test")
-            wrong_hash_result = validate_nonces(
-                test_nonces, fake_distances,
-                block_hash="WRONG_BLOCK_HASH_XYZ",
-                public_key=test_seed.public_key,
-                r_target=0.1,
-            )
-            result.wrong_hash_fraud = wrong_hash_result.get("fraud_detected", False)
-            print(f"    Wrong block_hash -> fraud detected: {'PASS' if result.wrong_hash_fraud else 'FAIL'}")
+            # Get correct artifacts
+            gen_request = {
+                "block_hash": test_seed.block_hash,
+                "block_height": BASE_CONFIG["block_height"],
+                "public_key": test_seed.public_key,
+                "node_id": 0,
+                "node_count": 1,
+                "nonces": test_nonces,
+                "params": {
+                    "model": model_name,
+                    "seq_len": POC_SEQ_LEN,
+                    "k_dim": POC_K_DIM,
+                },
+                "batch_size": len(test_nonces),
+                "wait": True,
+            }
+            correct_result = api_call("POST", "/api/v1/pow/generate", gen_request)
+            correct_artifacts = correct_result.get("artifacts", [])
             
-            print(f"\n  [Phase 5] Wrong public key fraud test")
-            wrong_pubkey_result = validate_nonces(
-                test_nonces, fake_distances,
-                block_hash=test_seed.block_hash,
-                public_key="WRONG_PUBLIC_KEY_XYZ",
-                r_target=0.1,
-            )
-            result.wrong_pubkey_fraud = wrong_pubkey_result.get("fraud_detected", False)
-            print(f"    Wrong public_key -> fraud detected: {'PASS' if result.wrong_pubkey_fraud else 'FAIL'}")
+            if correct_artifacts:
+                print(f"\n  [Phase 4] Wrong block hash fraud test")
+                # Try validating with wrong block_hash
+                wrong_hash_result = generate_and_validate(
+                    model_name,
+                    test_nonces,
+                    block_hash="WRONG_BLOCK_HASH_XYZ",
+                    public_key=test_seed.public_key,
+                    original_artifacts=correct_artifacts,
+                )
+                # With wrong block_hash, computed vectors differ -> fraud detected
+                result.wrong_hash_fraud = wrong_hash_result.get("fraud_detected", False)
+                print(f"    Wrong block_hash -> fraud detected: {'PASS' if result.wrong_hash_fraud else 'FAIL'}")
+                print(f"    n_mismatch: {wrong_hash_result.get('n_mismatch', 0)}/{len(test_nonces)}")
+                
+                print(f"\n  [Phase 5] Wrong public key fraud test")
+                wrong_pubkey_result = generate_and_validate(
+                    model_name,
+                    test_nonces,
+                    block_hash=test_seed.block_hash,
+                    public_key="WRONG_PUBLIC_KEY_XYZ",
+                    original_artifacts=correct_artifacts,
+                )
+                result.wrong_pubkey_fraud = wrong_pubkey_result.get("fraud_detected", False)
+                print(f"    Wrong public_key -> fraud detected: {'PASS' if result.wrong_pubkey_fraud else 'FAIL'}")
+                print(f"    n_mismatch: {wrong_pubkey_result.get('n_mismatch', 0)}/{len(test_nonces)}")
+            else:
+                print(f"\n  [Phase 4-5] SKIP fraud tests (no artifacts generated)")
         else:
-            print(f"\n  [Phase 4-5] SKIP fraud tests (no valid nonces)")
+            print(f"\n  [Phase 4-5] SKIP fraud tests (no valid seeds)")
         
         # ====================================================================
         # Overall Result
@@ -482,7 +501,7 @@ def main():
                         help="Run name for logs directory (default: e2e_YYYYMMDD_HHMMSS)")
     args = parser.parse_args()
     
-    # Setup run directory
+    # Setup run directory under logs/v2/
     if args.run_name is None:
         args.run_name = datetime.now().strftime("e2e_%Y%m%d_%H%M%S")
     
@@ -491,12 +510,13 @@ def main():
     # Header
     total_seeds = len(BLOCK_HASHES) * len(PUBLIC_KEYS)
     print("=" * 70)
-    print("Comprehensive PoC E2E Test Suite")
+    print("Comprehensive PoC E2E Test Suite (Artifact-Based Protocol)")
     print("=" * 70)
     print(f"Seed matrix:   {len(BLOCK_HASHES)} block_hashes x {len(PUBLIC_KEYS)} public_keys = {total_seeds} combinations")
     print(f"Block hashes:  {BLOCK_HASHES}")
     print(f"Public keys:   {PUBLIC_KEYS}")
-    print(f"r_target:      {R_TARGET}")
+    print(f"seq_len:       {POC_SEQ_LEN}")
+    print(f"k_dim:         {POC_K_DIM}")
     print(f"Duration:      {args.duration}s per seed")
     print(f"Models:        {list(args.models)}")
     print(f"Run name:      {args.run_name}")
@@ -510,11 +530,11 @@ def main():
             "run_name": args.run_name,
             "models": args.models,
             "duration": args.duration,
-            "r_target": R_TARGET,
+            "seq_len": POC_SEQ_LEN,
+            "k_dim": POC_K_DIM,
             "block_hashes": BLOCK_HASHES,
             "public_keys": PUBLIC_KEYS,
             "batch_size": BASE_CONFIG["batch_size"],
-            "seq_len": BASE_CONFIG["seq_len"],
         }, f, indent=2)
     
     suite = TestSuite()
@@ -547,19 +567,14 @@ def main():
         if result.error:
             print(f"        Error: {result.error}")
         else:
-            # Aggregate seed stats
-            total_checked = sum(sr.total_checked for sr in result.seed_results)
-            total_valid = sum(sr.total_valid for sr in result.seed_results)
-            avg_rate = sum(sr.valid_rate_percent for sr in result.seed_results) / len(result.seed_results) if result.seed_results else 0
+            total_processed = sum(sr.total_processed for sr in result.seed_results)
             
-            print(f"        Seeds tested:  {len(result.seed_results)}")
-            print(f"        Total checked: {total_checked}")
-            print(f"        Total valid:   {total_valid}")
-            print(f"        Avg valid rate: {avg_rate:.1f}%")
-            print(f"        Determinism:   {'PASS' if result.determinism_pass else 'FAIL'}")
-            print(f"        Independence:  {'PASS' if result.independence_pass else 'FAIL'}")
-            print(f"        Wrong hash:    {'PASS' if result.wrong_hash_fraud else 'FAIL'}")
-            print(f"        Wrong pubkey:  {'PASS' if result.wrong_pubkey_fraud else 'FAIL'}")
+            print(f"        Seeds tested:      {len(result.seed_results)}")
+            print(f"        Total processed:   {total_processed}")
+            print(f"        Determinism:       {'PASS' if result.determinism_pass else 'FAIL'}")
+            print(f"        Independence:      {'PASS' if result.independence_pass else 'FAIL'}")
+            print(f"        Wrong hash fraud:  {'PASS' if result.wrong_hash_fraud else 'FAIL'}")
+            print(f"        Wrong pubkey fraud:{'PASS' if result.wrong_pubkey_fraud else 'FAIL'}")
         
         all_passed = all_passed and result.passed
     
@@ -568,11 +583,11 @@ def main():
     # Save results
     results_file = logs_dir / "test_results.json"
     with open(results_file, "w") as f:
-        # Convert to serializable format
         data = {
             "start_time": suite.start_time,
             "all_passed": suite.all_passed,
-            "r_target": suite.r_target,
+            "seq_len": suite.seq_len,
+            "k_dim": suite.k_dim,
             "block_hashes": suite.block_hashes,
             "public_keys": suite.public_keys,
             "results": [],

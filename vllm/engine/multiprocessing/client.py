@@ -688,7 +688,7 @@ class MQLLMEngineClient(EngineClient):
         
         Args:
             action: The PoC action to perform ("init", "start_generate",
-                   "start_validate", "stop", "status", "run_batch", "validate")
+                   "stop", "status", "run_batch", "generate_artifacts")
             payload: Action-specific data
             
         Returns:

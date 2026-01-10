@@ -1,18 +1,28 @@
 #!/usr/bin/env python3
 """
-Data collection script for PoW experiments.
+Data collection script for PoC experiments (artifact-based protocol).
 
-Collects nonces, distances, and vectors from multiple servers.
+Collects nonces and artifacts (vector_b64) from multiple servers.
 
-Supports:
-- Single seed: block_hash + public_key
-- Multi-seed: block_hashes (list) + public_keys (list) -> iterates over all combinations
+Config format:
+{
+    "model": "Qwen/Qwen3-0.6B",
+    "seq_len": 256,
+    "k_dim": 12,
+    "block_hash": "...",  OR "block_hashes": ["...", "..."]
+    "public_key": "...",  OR "public_keys": ["...", "..."]
+    "block_height": 100,
+    "batch_size": 128,
+    "nonce_count": 500,
+    "servers": {"name1": "http://...", "name2": "http://..."}
+}
 
 Usage:
-    python scripts/collect_data.py --name my_experiment --config configs/servers_4.json
+    python scripts/collect_data.py --name my_experiment --config configs/servers.json
 """
 
 import argparse
+import base64
 import itertools
 import json
 import os
@@ -21,10 +31,11 @@ import signal
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import requests
 
 # Global shutdown event for Ctrl-C handling
@@ -34,13 +45,7 @@ _sigint_lock = threading.Lock()
 
 
 def signal_handler(signum, frame):
-    """Handle Ctrl-C by initiating shutdown; force-exit on repeated Ctrl-C.
-
-    Notes:
-    - Worker threads may be blocked in long `requests` calls and cannot be
-      interrupted safely. We therefore support a second Ctrl-C to force-exit
-      the process.
-    """
+    """Handle Ctrl-C by initiating shutdown; force-exit on repeated Ctrl-C."""
     global _sigint_count
     with _sigint_lock:
         _sigint_count += 1
@@ -67,6 +72,13 @@ def api_call(url: str, endpoint: str, method: str = "POST", json_data: dict = No
     return r.json()
 
 
+def decode_vector(b64: str) -> np.ndarray:
+    """Decode base64 FP16 little-endian to FP32."""
+    data = base64.b64decode(b64)
+    f16 = np.frombuffer(data, dtype='<f2')
+    return f16.astype(np.float32)
+
+
 def collect_from_server(name: str, url: str, config: dict, block_hash: str, public_key: str) -> dict:
     """Collect data from a single server for a specific seed."""
     # Stop any running generation
@@ -75,38 +87,56 @@ def collect_from_server(name: str, url: str, config: dict, block_hash: str, publ
     except Exception:
         pass  # Ignore if nothing running
 
-    # Build generation config
+    nonces = list(range(config.get("nonce_count", 500)))
+    
+    # Build generation request (new artifact-based API)
     gen_config = {
         "block_hash": block_hash,
         "block_height": config.get("block_height", 100),
         "public_key": public_key,
-        "r_target": config["r_target"],
         "node_id": 0,
         "node_count": 1,
-        "seq_len": config.get("seq_len", 128),
+        "nonces": nonces,
+        "params": {
+            "model": config["model"],
+            "seq_len": config.get("seq_len", 256),
+            "k_dim": config.get("k_dim", 12),
+        },
         "batch_size": config.get("batch_size", 128),
-        "nonces": list(range(config.get("nonce_count", 500))),
         "wait": True,
-        "return_vectors": True,
     }
 
-    # Generate
+    # Generate artifacts
     result = api_call(url, "/api/v1/pow/generate", json_data=gen_config)
+
+    # Extract artifacts
+    artifacts = result.get("artifacts", [])
+    encoding = result.get("encoding", {"dtype": "f16", "k_dim": config.get("k_dim", 12), "endian": "le"})
+    
+    # Decode vectors for analysis (store both base64 and decoded)
+    decoded_vectors = []
+    for artifact in artifacts:
+        try:
+            vec = decode_vector(artifact["vector_b64"])
+            decoded_vectors.append(vec.tolist())
+        except Exception:
+            decoded_vectors.append(None)
 
     return {
         "server_name": name,
         "server_url": url,
         "block_hash": block_hash,
         "public_key": public_key,
-        "nonces": result.get("valid_nonces", []),
-        "distances": result.get("valid_distances", []),
-        "vectors": result.get("vectors", []),
+        "nonces": [a["nonce"] for a in artifacts],
+        "artifacts": artifacts,
+        "vectors": decoded_vectors,
+        "encoding": encoding,
     }
 
 
 def find_latest_run(name: str) -> Path | None:
     """Find the most recent output directory for given experiment name."""
-    logs_dir = Path("logs")
+    logs_dir = Path("logs/v2")
     if not logs_dir.exists():
         return None
     
@@ -129,7 +159,7 @@ def get_completed_tasks(out_dir: Path) -> set[str]:
             with open(json_file) as f:
                 data = json.load(f)
             # Check if it has actual data (not an error)
-            if "error" not in data and data.get("nonces"):
+            if "error" not in data and data.get("artifacts"):
                 completed.add(json_file.stem)
         except Exception:
             pass
@@ -156,7 +186,7 @@ def main():
     # Register signal handler for Ctrl-C
     signal.signal(signal.SIGINT, signal_handler)
     
-    parser = argparse.ArgumentParser(description="Collect PoW data from multiple servers")
+    parser = argparse.ArgumentParser(description="Collect PoC data from multiple servers")
     parser.add_argument("--name", required=True, help="Experiment name")
     parser.add_argument("--config", required=True, help="Path to config JSON file")
     parser.add_argument("--continue", dest="continue_run", action="store_true",
@@ -167,6 +197,11 @@ def main():
     config_path = Path(args.config)
     with open(config_path) as f:
         config = json.load(f)
+
+    # Validate required config
+    if "model" not in config:
+        print("Error: config must include 'model' field")
+        sys.exit(1)
 
     # Resolve seeds - support both single and multi-seed configs
     if "block_hashes" in config:
@@ -182,7 +217,7 @@ def main():
     seeds = list(itertools.product(block_hashes, public_keys))
     multi_seed = len(seeds) > 1
 
-    # Determine output directory
+    # Determine output directory (under logs/v2/)
     if args.continue_run:
         out_dir = find_latest_run(args.name)
         if out_dir is None:
@@ -191,7 +226,7 @@ def main():
     
     if not args.continue_run:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_dir = Path("logs") / f"{args.name}_{timestamp}"
+        out_dir = Path("logs/v2") / f"{args.name}_{timestamp}"
         out_dir.mkdir(parents=True, exist_ok=True)
         # Save config copy
         shutil.copy(config_path, out_dir / "config.json")
@@ -200,7 +235,6 @@ def main():
     completed = get_completed_tasks(out_dir) if args.continue_run else set()
 
     # Build task list grouped by URL
-    # Each URL gets all its (server_name, block_hash, public_key) tasks
     url_to_tasks = {}
     for name, url in config["servers"].items():
         for block_hash, public_key in seeds:
@@ -211,6 +245,7 @@ def main():
     total_tasks = sum(len(tasks) for tasks in url_to_tasks.values())
     
     print(f"Output: {out_dir}")
+    print(f"Model: {config['model']}")
     print(f"Servers: {list(config['servers'].keys())}")
     print(f"Seeds: {len(seeds)} combinations")
     if multi_seed:
@@ -226,7 +261,6 @@ def main():
         """Process all seeds for one URL sequentially. Returns list of results."""
         results = []
         for name, block_hash, public_key in task_list:
-            # Check for shutdown before each task
             if shutdown_event.is_set():
                 break
             
@@ -237,7 +271,7 @@ def main():
                 result = collect_from_server(name, url, config, block_hash, public_key)
                 with open(out_dir / filename, "w") as f:
                     json.dump(result, f, indent=2)
-                results.append((name, block_hash, public_key, len(result["nonces"]), len(result["vectors"]), None))
+                results.append((name, block_hash, public_key, len(result["artifacts"]), None))
             except Exception as e:
                 if shutdown_event.is_set():
                     break
@@ -250,7 +284,7 @@ def main():
                 }
                 with open(out_dir / filename, "w") as f:
                     json.dump(error_result, f, indent=2)
-                results.append((name, block_hash, public_key, 0, 0, str(e)))
+                results.append((name, block_hash, public_key, 0, str(e)))
         
         return url, results
 
@@ -267,12 +301,10 @@ def main():
                 for url, task_list in url_to_tasks.items()
             ]
 
-            # Avoid blocking indefinitely in `as_completed()` so Ctrl-C is responsive.
             pending = set(futures)
             while pending:
                 if shutdown_event.is_set():
                     interrupted = True
-                    # Best-effort: cancel tasks that haven't started yet.
                     for f in list(pending):
                         f.cancel()
                     break
@@ -285,12 +317,12 @@ def main():
                 for future in done_now:
                     pending.remove(future)
                     url, results = future.result()
-                    for name, block_hash, public_key, nonce_count, vector_count, error in results:
+                    for name, block_hash, public_key, artifact_count, error in results:
                         seed_str = f" [{block_hash}+{public_key}]" if multi_seed else ""
                         if error:
                             print(f"{name}{seed_str}: FAILED - {error}")
                         else:
-                            print(f"{name}{seed_str}: OK ({nonce_count} nonces, {vector_count} vectors)")
+                            print(f"{name}{seed_str}: OK ({artifact_count} artifacts)")
     except KeyboardInterrupt:
         interrupted = True
         shutdown_event.set()

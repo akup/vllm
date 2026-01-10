@@ -397,56 +397,34 @@ class MQLLMEngine:
             from vllm.poc.config import PoCConfig
             config = PoCConfig(**payload)
             manager.init_round(config)
-            return {"status": "initialized", "pow_status": manager.get_status()}
+            return {"status": "OK", "pow_status": manager.get_status()}
 
         elif action == "start_generate":
             manager.start_generate()
-            return {"status": "generating", "pow_status": manager.get_status()}
-
-        elif action == "start_validate":
-            manager.start_validate()
-            return {"status": "validating", "pow_status": manager.get_status()}
+            return {"status": "OK", "pow_status": manager.get_status()}
 
         elif action == "stop":
             manager.stop_round()
-            return {"status": "stopped", "pow_status": manager.get_status()}
+            return {"status": "OK", "pow_status": manager.get_status()}
 
         elif action == "status":
             return manager.get_status()
 
         elif action == "run_batch":
-            batch = manager.run_batch()
-            return {
-                "nonces": batch.nonces,
-                "distances": batch.dist,
-                "pow_status": manager.get_status(),
-            }
+            return manager.run_batch()
 
-        elif action == "run_batch_with_state":
-            return manager.run_batch_with_state()
-
-        elif action == "queue_validation":
-            # Validate nonces and return results for callback
-            nonces = payload.get("nonces", [])
-            public_key = payload.get("public_key", "")
-            received_dist = payload.get("dist", None)
-            
-            result = manager.validate(nonces, public_key, received_dist)
-            return result
-
-        elif action == "generate_for_nonces":
-            return manager.generate_for_nonces(
+        elif action == "generate_artifacts":
+            from vllm.poc.data import Artifact
+            artifacts = manager.generate_artifacts(
                 nonces=payload.get("nonces", []),
                 block_hash=payload.get("block_hash", ""),
                 public_key=payload.get("public_key", ""),
-                r_target=payload.get("r_target", 0.5),
                 seq_len=payload.get("seq_len", 256),
-                return_vectors=payload.get("return_vectors", False),
+                k_dim=payload.get("k_dim", 12),
             )
-
-        elif action == "teardown_generate_hooks":
-            manager.teardown_generate_hooks()
-            return {"status": "ok"}
+            return {
+                "artifacts": [{"nonce": a.nonce, "vector_b64": a.vector_b64} for a in artifacts],
+            }
 
         else:
             raise ValueError(f"Unknown PoC action: {action}")

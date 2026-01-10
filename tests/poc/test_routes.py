@@ -1,17 +1,10 @@
-"""Tests for PoC API routes."""
+"""Tests for PoC API routes (artifact-based protocol)."""
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from vllm.poc.routes import (
-    router,
-    PoCInitRequest,
-    PoCValidateRequest,
-    PoCStatusResponse,
-)
-
-# Note: PoCValidateResponse was removed as /validate is now fire-and-forget
+from vllm.poc.routes import router
 from vllm.poc.config import PoCState
 
 
@@ -22,13 +15,9 @@ def mock_engine_client():
     
     # Default status response
     client.poc_request.return_value = {
-        "state": PoCState.IDLE.value,
-        "valid_nonces": [],
-        "valid_distances": [],
-        "total_checked": 0,
-        "total_valid": 0,
-        "elapsed_seconds": 0.0,
-        "rate_per_second": 0.0,
+        "status": PoCState.IDLE.value,
+        "config": None,
+        "stats": None,
     }
     
     return client
@@ -43,6 +32,11 @@ def app_with_poc(mock_engine_client):
     # Set up app state
     app.state.engine_client = mock_engine_client
     app.state.poc_enabled = True
+    app.state.poc_deployed = {
+        "model": "test-model",
+        "seq_len": 256,
+        "k_dim": 12,
+    }
     
     return app
 
@@ -53,165 +47,280 @@ def client(app_with_poc):
     return TestClient(app_with_poc)
 
 
-class TestPoCInit:
-    def test_init_round(self, client, mock_engine_client):
-        """Test initializing a PoC round."""
-        mock_engine_client.poc_request.return_value = {
-            "status": "initialized",
-            "pow_status": {
-                "state": PoCState.IDLE.value,
-                "valid_nonces": [],
-                "valid_distances": [],
-                "total_checked": 0,
-                "total_valid": 0,
-                "elapsed_seconds": 0.0,
-                "rate_per_second": 0.0,
-            }
-        }
-        
-        response = client.post("/api/v1/pow/init", json={
-            "block_hash": "abc123",
-            "block_height": 100,
-            "public_key": "pubkey123",
-            "r_target": 0.5,
-        })
-        
-        assert response.status_code == 200
-        data = response.json()
-        assert data["status"] == "OK"
-        assert "pow_status" in data
-        
-        # Verify engine was called correctly
-        mock_engine_client.poc_request.assert_called_once()
-        args = mock_engine_client.poc_request.call_args
-        assert args[0][0] == "init"
-
-    def test_init_generate(self, client, mock_engine_client):
-        """Test init with generate phase."""
-        mock_engine_client.poc_request.return_value = {
-            "status": "generating",
-            "pow_status": {
-                "state": PoCState.GENERATING.value,
-                "valid_nonces": [],
-                "valid_distances": [],
-                "total_checked": 0,
-                "total_valid": 0,
-                "elapsed_seconds": 0.0,
-                "rate_per_second": 0.0,
-            }
-        }
-        
-        response = client.post("/api/v1/pow/init/generate", json={
-            "block_hash": "abc123",
-            "block_height": 100,
-            "public_key": "pubkey123",
-            "r_target": 0.5,
-            "node_id": 0,
-            "node_count": 1,
-        })
-        
-        assert response.status_code == 200
-        data = response.json()
-        assert data["status"] == "OK"
-
-    def test_init_generate_requires_node_info(self, client, mock_engine_client):
-        """Test that init/generate requires node_id and node_count."""
-        response = client.post("/api/v1/pow/init/generate", json={
-            "block_hash": "abc123",
-            "block_height": 100,
-            "public_key": "pubkey123",
-            "r_target": 0.5,
-            # Missing node_id and node_count (default to -1)
-        })
-        
-        assert response.status_code == 400
-        assert "Node ID" in response.json()["detail"]
-
-    def test_init_validate(self, client, mock_engine_client):
-        """Test init with validate phase."""
-        mock_engine_client.poc_request.return_value = {
-            "status": "validating",
-            "pow_status": {
-                "state": PoCState.VALIDATING.value,
-                "valid_nonces": [],
-                "valid_distances": [],
-                "total_checked": 0,
-                "total_valid": 0,
-                "elapsed_seconds": 0.0,
-                "rate_per_second": 0.0,
-            }
-        }
-        
-        response = client.post("/api/v1/pow/init/validate", json={
-            "block_hash": "abc123",
-            "block_height": 100,
-            "public_key": "pubkey123",
-            "r_target": 0.5,
-        })
-        
-        assert response.status_code == 200
-        data = response.json()
-        assert data["status"] == "OK"
-
-
-class TestPoCPhase:
-    def test_switch_to_generate(self, client, mock_engine_client):
-        """Test switching to generate phase."""
-        mock_engine_client.poc_request.side_effect = [
-            # First call: status check (needs to be initialized, must include r_target)
-            {"state": PoCState.VALIDATING.value, "r_target": 1.5},
-            # Second call: start_generate
-            {"status": "generating", "pow_status": {"state": PoCState.GENERATING.value}},
-        ]
-        
-        response = client.post("/api/v1/pow/phase/generate")
-        
-        assert response.status_code == 200
-        data = response.json()
-        assert data["status"] == "OK"
-
-    def test_switch_to_validate(self, client, mock_engine_client):
-        """Test switching to validate phase."""
+class TestPoCInitGenerate:
+    def test_init_generate_starts_generation(self, client, mock_engine_client):
+        """Test /init/generate starts background generation."""
         mock_engine_client.poc_request.side_effect = [
             # First call: status check
-            {"state": PoCState.GENERATING.value},
-            # Second call: start_validate
-            {"status": "validating", "pow_status": {"state": PoCState.VALIDATING.value}},
+            {"status": PoCState.IDLE.value, "config": None},
+            # Second call: init
+            {"status": "OK", "pow_status": {"status": "IDLE"}},
+            # Third call: start_generate
+            {"status": "OK", "pow_status": {"status": "GENERATING"}},
         ]
         
-        response = client.post("/api/v1/pow/phase/validate")
+        response = client.post("/api/v1/pow/init/generate", json={
+            "block_hash": "abc123",
+            "block_height": 100,
+            "public_key": "pubkey123",
+            "node_id": 0,
+            "node_count": 1,
+            "batch_size": 32,
+            "params": {
+                "model": "test-model",
+                "seq_len": 256,
+                "k_dim": 12,
+            },
+        })
         
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "OK"
 
-    def test_phase_requires_init(self, client, mock_engine_client):
-        """Test that phase switch requires initialization."""
-        # Status returns IDLE state
+    def test_init_generate_conflict_when_already_generating(self, client, mock_engine_client):
+        """Test /init/generate returns 409 when already generating."""
         mock_engine_client.poc_request.return_value = {
-            "state": PoCState.IDLE.value
+            "status": PoCState.GENERATING.value,
         }
         
-        response = client.post("/api/v1/pow/phase/generate")
+        response = client.post("/api/v1/pow/init/generate", json={
+            "block_hash": "abc123",
+            "block_height": 100,
+            "public_key": "pubkey123",
+            "node_id": 0,
+            "node_count": 1,
+            "params": {
+                "model": "test-model",
+                "seq_len": 256,
+                "k_dim": 12,
+            },
+        })
+        
+        assert response.status_code == 409
+        assert "Already generating" in response.json()["detail"]
+
+    def test_init_generate_params_mismatch(self, client, mock_engine_client):
+        """Test /init/generate returns 409 when params don't match deployed."""
+        mock_engine_client.poc_request.return_value = {
+            "status": PoCState.IDLE.value,
+        }
+        
+        response = client.post("/api/v1/pow/init/generate", json={
+            "block_hash": "abc123",
+            "block_height": 100,
+            "public_key": "pubkey123",
+            "node_id": 0,
+            "node_count": 1,
+            "params": {
+                "model": "wrong-model",  # Doesn't match deployed
+                "seq_len": 256,
+                "k_dim": 12,
+            },
+        })
+        
+        assert response.status_code == 409
+        detail = response.json()["detail"]
+        assert detail["error"] == "params mismatch"
+        assert detail["requested"]["model"] == "wrong-model"
+        assert detail["deployed"]["model"] == "test-model"
+
+
+class TestPoCGenerate:
+    def test_generate_returns_artifacts(self, client, mock_engine_client):
+        """Test /generate computes artifacts for given nonces."""
+        mock_engine_client.poc_request.side_effect = [
+            # First call: status check
+            {"status": PoCState.IDLE.value},
+            # Second call: generate_artifacts
+            {
+                "artifacts": [
+                    {"nonce": 0, "vector_b64": "AAAAAAA="},
+                    {"nonce": 1, "vector_b64": "BBBBBBB="},
+                ],
+            },
+        ]
+        
+        response = client.post("/api/v1/pow/generate", json={
+            "block_hash": "abc123",
+            "block_height": 100,
+            "public_key": "pubkey123",
+            "node_id": 0,
+            "node_count": 1,
+            "nonces": [0, 1],
+            "params": {
+                "model": "test-model",
+                "seq_len": 256,
+                "k_dim": 12,
+            },
+            "wait": True,
+        })
+        
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "completed"
+        assert len(data["artifacts"]) == 2
+        assert data["encoding"]["dtype"] == "f16"
+
+    def test_generate_conflict_when_busy(self, client, mock_engine_client):
+        """Test /generate returns 409 when /init/generate is running."""
+        mock_engine_client.poc_request.return_value = {
+            "status": PoCState.GENERATING.value,
+        }
+        
+        response = client.post("/api/v1/pow/generate", json={
+            "block_hash": "abc123",
+            "block_height": 100,
+            "public_key": "pubkey123",
+            "node_id": 0,
+            "node_count": 1,
+            "nonces": [0, 1],
+            "params": {
+                "model": "test-model",
+                "seq_len": 256,
+                "k_dim": 12,
+            },
+            "wait": True,
+        })
+        
+        assert response.status_code == 409
+        assert "Busy" in response.json()["detail"]
+
+    def test_generate_wait_false_returns_queued(self, client, mock_engine_client):
+        """Test /generate with wait=false returns queued status."""
+        mock_engine_client.poc_request.return_value = {
+            "status": PoCState.IDLE.value,
+        }
+        
+        response = client.post("/api/v1/pow/generate", json={
+            "block_hash": "abc123",
+            "block_height": 100,
+            "public_key": "pubkey123",
+            "node_id": 0,
+            "node_count": 1,
+            "nonces": [0, 1, 2],
+            "params": {
+                "model": "test-model",
+                "seq_len": 256,
+                "k_dim": 12,
+            },
+            "wait": False,
+        })
+        
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "queued"
+        assert data["queued_count"] == 3
+
+    def test_generate_with_validation_detects_mismatch(self, client, mock_engine_client):
+        """Test /generate with validation field performs comparison."""
+        # 12-dim vectors: all zeros vs all ones (very different)
+        # zeros: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+        # ones:  ADwAPAA8ADwAPAA8ADwAPAA8ADwAPAA8
+        mock_engine_client.poc_request.side_effect = [
+            # First call: status check
+            {"status": PoCState.IDLE.value},
+            # Second call: generate_artifacts - returns zeros
+            {
+                "artifacts": [
+                    {"nonce": 0, "vector_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+                    {"nonce": 1, "vector_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+                ],
+            },
+        ]
+        
+        response = client.post("/api/v1/pow/generate", json={
+            "block_hash": "abc123",
+            "block_height": 100,
+            "public_key": "pubkey123",
+            "node_id": 0,
+            "node_count": 1,
+            "nonces": [0, 1],
+            "params": {
+                "model": "test-model",
+                "seq_len": 256,
+                "k_dim": 12,
+            },
+            "wait": True,
+            "validation": {
+                "artifacts": [
+                    {"nonce": 0, "vector_b64": "ADwAPAA8ADwAPAA8ADwAPAA8ADwAPAA8"},  # ones - different
+                    {"nonce": 1, "vector_b64": "ADwAPAA8ADwAPAA8ADwAPAA8ADwAPAA8"},
+                ],
+            },
+            "stat_test": {
+                "dist_threshold": 0.02,
+                "p_mismatch": 0.001,
+                "fraud_threshold": 0.01,
+            },
+        })
+        
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "completed"
+        assert data["n_mismatch"] == 2
+        assert data["fraud_detected"] is True
+
+    def test_generate_validation_nonce_mismatch_error(self, client, mock_engine_client):
+        """Test /generate returns 400 if validation nonces don't match."""
+        mock_engine_client.poc_request.return_value = {
+            "status": PoCState.IDLE.value,
+        }
+        
+        response = client.post("/api/v1/pow/generate", json={
+            "block_hash": "abc123",
+            "block_height": 100,
+            "public_key": "pubkey123",
+            "node_id": 0,
+            "node_count": 1,
+            "nonces": [0, 1],  # Two nonces
+            "params": {
+                "model": "test-model",
+                "seq_len": 256,
+                "k_dim": 12,
+            },
+            "wait": True,
+            "validation": {
+                "artifacts": [
+                    {"nonce": 0, "vector_b64": "AAA="},
+                    {"nonce": 5, "vector_b64": "BBB="},  # Wrong nonce
+                ],
+            },
+        })
         
         assert response.status_code == 400
-        assert "not initialized" in response.json()["detail"]
+        assert "must match" in response.json()["detail"]
+
+
+class TestPoCStatus:
+    def test_get_status(self, client, mock_engine_client):
+        """Test getting PoC status."""
+        mock_engine_client.poc_request.return_value = {
+            "status": "GENERATING",
+            "config": {
+                "block_hash": "abc123",
+                "block_height": 100,
+                "k_dim": 12,
+            },
+            "stats": {
+                "total_processed": 500,
+                "nonces_per_second": 20.0,
+            },
+        }
+        
+        response = client.get("/api/v1/pow/status")
+        
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "GENERATING"
+        assert data["stats"]["total_processed"] == 500
 
 
 class TestPoCStop:
     def test_stop_round(self, client, mock_engine_client):
         """Test stopping a PoC round."""
         mock_engine_client.poc_request.return_value = {
-            "status": "stopped",
-            "pow_status": {
-                "state": PoCState.STOPPED.value,
-                "valid_nonces": [1, 2, 3],
-                "valid_distances": [0.1, 0.2, 0.3],
-                "total_checked": 100,
-                "total_valid": 3,
-                "elapsed_seconds": 10.5,
-                "rate_per_second": 9.5,
-            }
+            "status": "OK",
+            "pow_status": {"status": "STOPPED"},
         }
         
         response = client.post("/api/v1/pow/stop")
@@ -219,76 +328,6 @@ class TestPoCStop:
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "OK"
-        assert "pow_status" in data
-
-
-class TestPoCStatus:
-    def test_get_status(self, client, mock_engine_client):
-        """Test getting PoC status."""
-        mock_engine_client.poc_request.return_value = {
-            "state": PoCState.GENERATING.value,
-            "valid_nonces": [1, 5, 10],
-            "valid_distances": [0.1, 0.2, 0.3],
-            "total_checked": 500,
-            "total_valid": 3,
-            "elapsed_seconds": 25.0,
-            "rate_per_second": 20.0,
-        }
-        
-        response = client.get("/api/v1/pow/status")
-        
-        assert response.status_code == 200
-        data = response.json()
-        assert data["state"] == "GENERATING"
-        assert data["valid_nonces"] == [1, 5, 10]
-        assert data["total_checked"] == 500
-        assert data["total_valid"] == 3
-
-
-class TestPoCValidate:
-    def test_validate_nonces_fire_and_forget(self, client, mock_engine_client):
-        """Test validating nonces (fire-and-forget, matching original API)."""
-        # Mock status to show round is configured
-        def mock_poc_request(action, payload):
-            if action == "status":
-                return {"state": PoCState.VALIDATING.value}
-            elif action == "queue_validation":
-                return {"status": "queued"}
-            return {}
-        
-        mock_engine_client.poc_request.side_effect = mock_poc_request
-        
-        response = client.post("/api/v1/pow/validate", json={
-            "public_key": "pubkey123",
-            "block_hash": "abc123",
-            "block_height": 100,
-            "nonces": [1, 2, 3],
-            "dist": [0.1, 0.6, 0.2],
-            "node_id": 0,
-        })
-        
-        assert response.status_code == 200
-        data = response.json()
-        # Fire-and-forget returns just status OK
-        assert data["status"] == "OK"
-
-    def test_validate_requires_init(self, client, mock_engine_client):
-        """Test that validate requires round to be configured."""
-        mock_engine_client.poc_request.return_value = {
-            "state": PoCState.IDLE.value
-        }
-        
-        response = client.post("/api/v1/pow/validate", json={
-            "public_key": "pubkey123",
-            "block_hash": "abc123",
-            "block_height": 100,
-            "nonces": [1, 2, 3],
-            "dist": [0.1, 0.6, 0.2],
-            "node_id": 0,
-        })
-        
-        assert response.status_code == 400
-        assert "No round configured" in response.json()["detail"]
 
 
 class TestPoCDisabled:
@@ -297,19 +336,12 @@ class TestPoCDisabled:
         app = FastAPI()
         app.include_router(router)
         
-        # PoC not enabled
         app.state.poc_enabled = False
         app.state.engine_client = AsyncMock()
         
         client = TestClient(app)
         
-        # All endpoints should return 503
-        response = client.post("/api/v1/pow/init", json={
-            "block_hash": "abc123",
-            "block_height": 100,
-            "public_key": "pubkey123",
-            "r_target": 0.5,
-        })
+        response = client.get("/api/v1/pow/status")
         assert response.status_code == 503
         assert "not enabled" in response.json()["detail"]
 
@@ -328,49 +360,47 @@ class TestPoCDisabled:
         assert "not available" in response.json()["detail"]
 
 
-class TestPoCRequestModels:
-    def test_init_request_defaults(self):
-        """Test PoCInitRequest default values."""
-        req = PoCInitRequest(
-            block_hash="abc",
-            block_height=100,
-            public_key="pub",
-            r_target=0.5,
-        )
-        
-        assert req.fraud_threshold == 0.01
-        assert req.node_id == -1
-        assert req.node_count == -1
-        assert req.batch_size == 32
-        assert req.seq_len == 256
-        assert req.callback_url is None
+class TestRemovedEndpoints:
+    """Test that old endpoints are removed (404)."""
+    
+    def test_old_init_removed(self, client):
+        """Test /init endpoint no longer exists."""
+        response = client.post("/api/v1/pow/init", json={
+            "block_hash": "abc123",
+            "block_height": 100,
+            "public_key": "pubkey123",
+            "r_target": 0.5,
+        })
+        assert response.status_code == 404
 
-    def test_validate_request(self):
-        """Test PoCValidateRequest model."""
-        req = PoCValidateRequest(
-            public_key="pub",
-            block_hash="abc",
-            block_height=100,
-            nonces=[1, 2, 3],
-            dist=[0.1, 0.2, 0.3],
-            node_id=0,
-        )
-        
-        assert req.nonces == [1, 2, 3]
-        assert req.dist == [0.1, 0.2, 0.3]
+    def test_old_init_validate_removed(self, client):
+        """Test /init/validate endpoint no longer exists."""
+        response = client.post("/api/v1/pow/init/validate", json={
+            "block_hash": "abc123",
+            "block_height": 100,
+            "public_key": "pubkey123",
+            "r_target": 0.5,
+        })
+        assert response.status_code == 404
 
-    def test_status_response(self):
-        """Test PoCStatusResponse model."""
-        resp = PoCStatusResponse(
-            state="generating",
-            valid_nonces=[1, 2],
-            valid_distances=[0.1, 0.2],
-            total_checked=100,
-            total_valid=2,
-            elapsed_seconds=10.0,
-            rate_per_second=10.0,
-        )
-        
-        assert resp.state == "generating"
-        assert resp.total_checked == 100
+    def test_old_phase_generate_removed(self, client):
+        """Test /phase/generate endpoint no longer exists."""
+        response = client.post("/api/v1/pow/phase/generate")
+        assert response.status_code == 404
 
+    def test_old_phase_validate_removed(self, client):
+        """Test /phase/validate endpoint no longer exists."""
+        response = client.post("/api/v1/pow/phase/validate")
+        assert response.status_code == 404
+
+    def test_old_validate_removed(self, client):
+        """Test /validate endpoint no longer exists."""
+        response = client.post("/api/v1/pow/validate", json={
+            "public_key": "pubkey123",
+            "block_hash": "abc123",
+            "block_height": 100,
+            "nonces": [1, 2, 3],
+            "dist": [0.1, 0.2, 0.3],
+            "node_id": 0,
+        })
+        assert response.status_code == 404

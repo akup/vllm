@@ -130,7 +130,7 @@ class RPCAdapterLoadedResponse:
 @dataclass
 class RPCPoCRequest:
     """Generic PoC request - single type for all PoC operations."""
-    action: str  # "init", "start_generate", "start_validate", "stop", "status", "validate"
+    action: str  # "init", "start_generate", "stop", "status", "run_batch", "generate_artifacts"
     payload: dict  # Action-specific data
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
