@@ -683,16 +683,23 @@ class MQLLMEngineClient(EngineClient):
         if isinstance(request_output, BaseException):
             raise request_output
 
-    async def poc_request(self, action: str, payload: dict) -> dict:
+    async def poc_request(self, action: str, payload: dict,
+                          timeout_ms: Optional[int] = None) -> dict:
         """Send a PoC (Proof of Compute) request to the engine.
         
         Args:
             action: The PoC action to perform ("init", "start_generate",
                    "stop", "status", "run_batch", "generate_artifacts")
             payload: Action-specific data
+            timeout_ms: Optional timeout in milliseconds. If None, uses
+                       VLLM_RPC_TIMEOUT. Set to 0 to disable timeout.
             
         Returns:
             Result dictionary from the engine
+            
+        Raises:
+            TimeoutError: If engine doesn't respond within timeout
+            RuntimeError: If engine returns an error
         """
         request = RPCPoCRequest(action=action, payload=payload)
 
@@ -705,9 +712,24 @@ class MQLLMEngineClient(EngineClient):
         request_bytes = pickle.dumps(request)
         await self.input_socket.send_multipart((request_bytes, ), copy=False)
 
-        # Wait for the response
-        request_output = await queue.get()
-        self.output_queues.pop(request.request_id)
+        # Wait for the response with timeout
+        # Default to VLLM_RPC_TIMEOUT if not specified
+        if timeout_ms is None:
+            timeout_ms = VLLM_RPC_TIMEOUT
+        timeout_sec = timeout_ms / 1000.0 if timeout_ms > 0 else None
+        
+        try:
+            request_output = await asyncio.wait_for(
+                queue.get(), timeout=timeout_sec)
+        except asyncio.TimeoutError:
+            # Clean up the queue on timeout
+            self.output_queues.pop(request.request_id, None)
+            raise TimeoutError(
+                f"PoC request '{action}' timed out after {timeout_ms}ms. "
+                "Engine may be wedged."
+            )
+        
+        self.output_queues.pop(request.request_id, None)
 
         if isinstance(request_output, BaseException):
             raise request_output

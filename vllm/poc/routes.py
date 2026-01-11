@@ -30,6 +30,9 @@ router = APIRouter(prefix="/api/v1/pow", tags=["PoC"])
 # Callback interval for /init/generate (seconds)
 POC_CALLBACK_INTERVAL_SEC = float(os.environ.get("POC_CALLBACK_INTERVAL_SEC", "5"))
 
+# Per-chunk timeout for /generate endpoint when engine is busy (seconds)
+POC_GENERATE_CHUNK_TIMEOUT_SEC = float(os.environ.get("POC_GENERATE_CHUNK_TIMEOUT_SEC", "60"))
+
 # Module-level state
 _poc_tasks: Dict[int, Dict[str, Any]] = {}
 
@@ -117,6 +120,21 @@ async def check_poc_enabled(request: Request):
         raise HTTPException(status_code=503, detail="PoC not enabled")
 
 
+def check_mp_engine_required(engine_client):
+    """Check that we're using MP engine for PoC coexistence.
+    
+    PoC+chat coexistence is only supported in multiprocessing engine mode.
+    In-process mode risks NCCL deadlocks from concurrent GPU work.
+    """
+    from vllm.engine.multiprocessing.client import MQLLMEngineClient
+    if not isinstance(engine_client, MQLLMEngineClient):
+        raise HTTPException(
+            status_code=503,
+            detail="PoC coexistence requires multiprocessing engine mode. "
+                   "Remove --disable-frontend-multiprocessing or use MP engine."
+        )
+
+
 def check_params_match(request: Request, params: PoCParamsModel):
     """Check if model matches deployed model. Raises 409 if mismatch."""
     # Get model names from openai_serving_models
@@ -164,6 +182,13 @@ async def _cancel_poc_tasks(app_id: int):
 # Background Tasks for /init/generate
 # =============================================================================
 
+# Backoff sleep when PoC is skipped due to chat being busy (seconds)
+POC_CHAT_BUSY_BACKOFF_SEC = 0.05
+
+# Timeout for run_batch RPC during coexistence (ms)
+# Needs to be longer than VLLM_RPC_TIMEOUT to survive long inference steps
+POC_RUN_BATCH_TIMEOUT_MS = int(os.environ.get("POC_RUN_BATCH_TIMEOUT_MS", "60000"))
+
 async def _generation_loop(
     engine_client,
     stop_event: asyncio.Event,
@@ -177,13 +202,41 @@ async def _generation_loop(
     
     logger.info(f"PoC generation started")
     
+    skip_count = 0
+    timeout_count = 0
     try:
         while not stop_event.is_set():
-            result = await engine_client.poc_request("run_batch", {})
+            try:
+                # Use longer timeout for run_batch since it waits for engine step
+                result = await engine_client.poc_request(
+                    "run_batch", {}, timeout_ms=POC_RUN_BATCH_TIMEOUT_MS
+                )
+                timeout_count = 0  # Reset on successful RPC
+            except TimeoutError:
+                # Timeout is recoverable - engine is busy with chat inference
+                # (long prefill can exceed VLLM_RPC_TIMEOUT)
+                timeout_count += 1
+                if timeout_count == 1 or timeout_count % 10 == 0:
+                    logger.warning(
+                        f"PoC run_batch timed out (#{timeout_count}), "
+                        "engine busy with inference. Retrying..."
+                    )
+                await asyncio.sleep(POC_CHAT_BUSY_BACKOFF_SEC * 2)  # Longer backoff for timeout
+                continue
             
             if not result.get("should_continue", False):
+                logger.info("PoC generation loop ending: should_continue=False")
                 break
             
+            # Chat-priority: if skipped due to engine step in progress, backoff
+            if result.get("skipped"):
+                skip_count += 1
+                if skip_count % 100 == 1:  # Log every 100 skips (~5s at 50ms backoff)
+                    logger.debug(f"PoC yielding to engine step (skip #{skip_count})")
+                await asyncio.sleep(POC_CHAT_BUSY_BACKOFF_SEC)
+                continue
+            
+            skip_count = 0  # Reset on successful batch
             artifacts = result.get("artifacts", [])
             if artifacts:
                 await artifact_queue.put({
@@ -207,6 +260,16 @@ async def _generation_loop(
     except asyncio.CancelledError:
         elapsed_min = (time.time() - start_time) / 60
         logger.info(f"PoC stopped: {total_processed} nonces in {elapsed_min:.2f}min")
+    except Exception as e:
+        # Log all other exceptions so the loop doesn't die silently
+        elapsed_min = (time.time() - start_time) / 60
+        logger.error(
+            f"PoC generation loop crashed after {total_processed} nonces "
+            f"in {elapsed_min:.2f}min: {e}",
+            exc_info=True
+        )
+        # Re-raise so the task shows as failed (caller can check)
+        raise
 
 
 async def _callback_sender_loop(
@@ -299,6 +362,9 @@ async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
     check_params_match(request, body.params)
     engine_client = await get_engine_client(request)
     
+    # PoC+chat coexistence requires MP engine mode
+    check_mp_engine_required(engine_client)
+    
     app_id = id(request.app)
     
     # Check for conflicts
@@ -362,6 +428,9 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
     check_params_match(request, body.params)
     engine_client = await get_engine_client(request)
     
+    # PoC+chat coexistence requires MP engine mode
+    check_mp_engine_required(engine_client)
+    
     # Check for conflicts with /init/generate
     status = await engine_client.poc_request("status", {})
     if status.get("status") == PoCState.GENERATING.value:
@@ -386,19 +455,39 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
         }
     
     # Compute artifacts in batches (per spec: split nonces into chunks of batch_size)
+    # Each chunk retries with backoff if engine is busy (skipped=True)
     computed_artifacts = []
     batch_size = body.batch_size
     
     for i in range(0, len(body.nonces), batch_size):
         chunk = body.nonces[i:i + batch_size]
-        result = await engine_client.poc_request("generate_artifacts", {
-            "nonces": chunk,
-            "block_hash": body.block_hash,
-            "public_key": body.public_key,
-            "seq_len": body.params.seq_len,
-            "k_dim": body.params.k_dim,
-        })
-        computed_artifacts.extend(result.get("artifacts", []))
+        chunk_start_time = time.time()
+        
+        while True:
+            result = await engine_client.poc_request("generate_artifacts", {
+                "nonces": chunk,
+                "block_hash": body.block_hash,
+                "public_key": body.public_key,
+                "seq_len": body.params.seq_len,
+                "k_dim": body.params.k_dim,
+            })
+            
+            # If not skipped, we got our artifacts
+            if not result.get("skipped"):
+                computed_artifacts.extend(result.get("artifacts", []))
+                break
+            
+            # Check per-chunk timeout
+            elapsed = time.time() - chunk_start_time
+            if elapsed >= POC_GENERATE_CHUNK_TIMEOUT_SEC:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Timeout waiting for engine: chunk {i//batch_size} "
+                           f"timed out after {elapsed:.1f}s"
+                )
+            
+            # Backoff before retry (async, doesn't block thread)
+            await asyncio.sleep(POC_CHAT_BUSY_BACKOFF_SEC)
     
     # If no validation, return computed artifacts
     if not body.validation:

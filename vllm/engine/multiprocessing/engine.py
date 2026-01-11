@@ -113,6 +113,11 @@ class MQLLMEngine:
         # Error state.
         self._errored_with: Optional[BaseException] = None
 
+        # PoC coexistence: flag indicating engine.step() is in progress
+        # Used to prevent PoC GPU actions from running re-entrantly via
+        # the async socket callback path.
+        self._engine_step_in_progress: bool = False
+
     @property
     def dead_error(self) -> BaseException:
         if self._errored_with is not None:
@@ -232,6 +237,7 @@ class MQLLMEngine:
 
     def engine_step(self) -> List[RequestOutput]:
         """Engine step wrapper with error handling."""
+        self._engine_step_in_progress = True
         try:
             return self.engine.step()
         except SystemExit:
@@ -251,6 +257,8 @@ class MQLLMEngine:
                                exception=e)
             self._send_outputs(rpc_err)
             raise e
+        finally:
+            self._engine_step_in_progress = False
 
     def handle_new_input(self):
         """Handle new input from the socket"""
@@ -389,6 +397,23 @@ class MQLLMEngine:
             )
         return self._poc_manager
 
+    def _prepare_for_poc_gpu_work(self) -> None:
+        """Prepare executor for PoC GPU work by stopping remote worker loop.
+        
+        In v0 distributed execution, remote TP workers run an infinite loop
+        (start_worker_execution_loop) that blocks on broadcast_tensor_dict.
+        PoC uses collective_rpc which requires ALL workers to be free.
+        
+        If the remote loop is running, we must stop it first so workers can
+        service the PoC collective_rpc call. The loop will restart automatically
+        on the next chat execute_model() call.
+        """
+        executor = self.engine.model_executor
+        # Check if this is a distributed executor with remote worker loop
+        if hasattr(executor, 'parallel_worker_tasks') and executor.parallel_worker_tasks is not None:
+            logger.debug("Stopping remote worker execution loop for PoC GPU work")
+            executor.stop_remote_worker_execution_loop()
+
     def _process_poc_action(self, action: str, payload: dict) -> dict:
         """Process a PoC action and return result."""
         manager = self._get_poc_manager()
@@ -411,9 +436,68 @@ class MQLLMEngine:
             return manager.get_status()
 
         elif action == "run_batch":
+            # PoC coexistence: chat has priority over PoC GPU work
+            # Check 1: Skip if there's pending input (chat requests waiting)
+            # This ensures chat is processed first before PoC blocks on GPU
+            if self.input_socket.poll(timeout=0) != 0:
+                return {
+                    "should_continue": True,
+                    "state": manager.state.value,
+                    "nonces": [],
+                    "artifacts": [],
+                    "skipped": True,
+                    "reason": "pending_input",
+                }
+            # Check 2: Skip if we're inside engine.step() (async callback path)
+            if self._engine_step_in_progress:
+                return {
+                    "should_continue": True,
+                    "state": manager.state.value,
+                    "nonces": [],
+                    "artifacts": [],
+                    "skipped": True,
+                    "reason": "engine_step_in_progress",
+                }
+            # Check 3: Skip if chat has unfinished requests (still processing)
+            # This prevents PoC collective_rpc while chat might restart the loop
+            if self.engine.has_unfinished_requests():
+                return {
+                    "should_continue": True,
+                    "state": manager.state.value,
+                    "nonces": [],
+                    "artifacts": [],
+                    "skipped": True,
+                    "reason": "chat_unfinished",
+                }
+            # Safe to proceed: stop remote worker loop if running (v0 TP deadlock fix)
+            self._prepare_for_poc_gpu_work()
             return manager.run_batch()
 
         elif action == "generate_artifacts":
+            # PoC coexistence: chat has priority over PoC GPU work
+            # Check 1: Skip if there's pending input (chat requests waiting)
+            if self.input_socket.poll(timeout=0) != 0:
+                return {
+                    "artifacts": [],
+                    "skipped": True,
+                    "reason": "pending_input",
+                }
+            # Check 2: Skip if we're inside engine.step() (async callback path)
+            if self._engine_step_in_progress:
+                return {
+                    "artifacts": [],
+                    "skipped": True,
+                    "reason": "engine_step_in_progress",
+                }
+            # Check 3: Skip if chat has unfinished requests (still processing)
+            if self.engine.has_unfinished_requests():
+                return {
+                    "artifacts": [],
+                    "skipped": True,
+                    "reason": "chat_unfinished",
+                }
+            # Safe to proceed: stop remote worker loop if running (v0 TP deadlock fix)
+            self._prepare_for_poc_gpu_work()
             from vllm.poc.data import Artifact
             artifacts = manager.generate_artifacts(
                 nonces=payload.get("nonces", []),
