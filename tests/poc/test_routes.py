@@ -8,9 +8,18 @@ from vllm.poc.routes import router
 from vllm.poc.config import PoCState
 
 
+# Mock class that simulates MQLLMEngineClient for tests
+class _MockMQLLMEngineClient:
+    """Mock that passes the MP engine requirement check."""
+    pass
+
+
 @pytest.fixture
 def mock_engine_client():
-    """Create a mock engine client for testing."""
+    """Create a mock engine client for testing.
+    
+    Creates a mock that will pass the isinstance check for MP engine.
+    """
     client = AsyncMock()
     
     # Default status response
@@ -38,13 +47,25 @@ def app_with_poc(mock_engine_client):
         "k_dim": 12,
     }
     
+    # Set up mock openai_serving_models for params checking
+    mock_base_path = MagicMock()
+    mock_base_path.model_path = "test-model"
+    mock_base_path.name = "test-model"
+    
+    mock_serving_models = MagicMock()
+    mock_serving_models.base_model_paths = [mock_base_path]
+    app.state.openai_serving_models = mock_serving_models
+    
     return app
 
 
 @pytest.fixture
-def client(app_with_poc):
-    """Create test client."""
-    return TestClient(app_with_poc)
+def client(app_with_poc, mock_engine_client):
+    """Create test client that patches the MP engine check."""
+    # Patch the check to accept our mock client by making
+    # MQLLMEngineClient point to AsyncMock's type
+    with patch('vllm.engine.multiprocessing.client.MQLLMEngineClient', type(mock_engine_client)):
+        yield TestClient(app_with_poc)
 
 
 class TestPoCInitGenerate:
@@ -120,9 +141,8 @@ class TestPoCInitGenerate:
         
         assert response.status_code == 409
         detail = response.json()["detail"]
-        assert detail["error"] == "params mismatch"
-        assert detail["requested"]["model"] == "wrong-model"
-        assert detail["deployed"]["model"] == "test-model"
+        assert "model mismatch" in detail.lower()
+        assert "wrong-model" in detail
 
 
 class TestPoCGenerate:

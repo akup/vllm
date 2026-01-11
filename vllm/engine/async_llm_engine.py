@@ -1215,9 +1215,24 @@ class AsyncLLMEngine(EngineClient):
             return manager.get_status()
         
         elif action == "run_batch":
+            # Chat-priority: skip PoC forward if chat has unfinished requests
+            if self.engine.has_unfinished_requests():
+                return {
+                    "should_continue": True,
+                    "state": manager.state.value,
+                    "nonces": [],
+                    "artifacts": [],
+                    "skipped": True,
+                }
             return manager.run_batch()
         
         elif action == "generate_artifacts":
+            # Chat-priority: skip if chat has unfinished requests
+            if self.engine.has_unfinished_requests():
+                return {
+                    "artifacts": [],
+                    "skipped": True,
+                }
             from vllm.poc.data import Artifact
             artifacts = manager.generate_artifacts(
                 nonces=payload.get("nonces", []),
