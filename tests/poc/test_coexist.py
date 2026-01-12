@@ -144,7 +144,6 @@ class TestGenerationLoopBackoff:
     async def test_generation_loop_backs_off_on_skip(self, mock_engine_client):
         """Test that generation loop backs off when engine returns skipped."""
         stop_event = asyncio.Event()
-        artifact_queue = asyncio.Queue()
         config = {
             "block_hash": "hash",
             "block_height": 100,
@@ -157,23 +156,20 @@ class TestGenerationLoopBackoff:
         }
         stats = {"start_time": 0, "total_processed": 0}
         
-        # Return skipped twice, then cancel
         call_count = 0
         async def mock_poc_request(action, payload, timeout_ms=None):
             nonlocal call_count
             call_count += 1
             if call_count <= 2:
                 return {"skipped": True, "artifacts": []}
-            # Stop after 2 skips
             stop_event.set()
             return {"artifacts": [], "skipped": True}
         
         mock_engine_client.poc_request = mock_poc_request
         
-        # Run the loop briefly
         with patch('vllm.poc.routes.POC_CHAT_BUSY_BACKOFF_SEC', 0.001):
             task = asyncio.create_task(
-                _generation_loop(mock_engine_client, stop_event, artifact_queue, config, stats)
+                _generation_loop(mock_engine_client, stop_event, None, config, stats)
             )
             await asyncio.sleep(0.1)
             stop_event.set()
@@ -182,7 +178,6 @@ class TestGenerationLoopBackoff:
             except asyncio.CancelledError:
                 pass
         
-        # Should have called poc_request multiple times due to backoff retries
         assert call_count >= 2
 
 
