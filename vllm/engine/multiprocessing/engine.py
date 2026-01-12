@@ -415,103 +415,51 @@ class MQLLMEngine:
             executor.stop_remote_worker_execution_loop()
 
     def _process_poc_action(self, action: str, payload: dict) -> dict:
-        """Process a PoC action and return result."""
-        manager = self._get_poc_manager()
-
-        if action == "init":
-            from vllm.poc.config import PoCConfig
-            config = PoCConfig(**payload)
-            manager.init_round(config)
-            return {"status": "OK", "pow_status": manager.get_status()}
-
-        elif action == "start_generate":
-            manager.start_generate()
-            return {"status": "OK", "pow_status": manager.get_status()}
-
-        elif action == "stop":
-            manager.stop_round()
-            return {"status": "OK", "pow_status": manager.get_status()}
-
-        elif action == "status":
-            return manager.get_status()
-
-        elif action == "run_batch":
-            # PoC coexistence: chat has priority over PoC GPU work
-            # Check 1: Skip if there's pending input (chat requests waiting)
-            # This ensures chat is processed first before PoC blocks on GPU
-            if self.input_socket.poll(timeout=0) != 0:
-                return {
-                    "should_continue": True,
-                    "state": manager.state.value,
-                    "nonces": [],
-                    "artifacts": [],
-                    "skipped": True,
-                    "reason": "pending_input",
-                }
-            # Check 2: Skip if we're inside engine.step() (async callback path)
-            if self._engine_step_in_progress:
-                return {
-                    "should_continue": True,
-                    "state": manager.state.value,
-                    "nonces": [],
-                    "artifacts": [],
-                    "skipped": True,
-                    "reason": "engine_step_in_progress",
-                }
-            # Check 3: Skip if chat has unfinished requests (still processing)
-            # This prevents PoC collective_rpc while chat might restart the loop
-            if self.engine.has_unfinished_requests():
-                return {
-                    "should_continue": True,
-                    "state": manager.state.value,
-                    "nonces": [],
-                    "artifacts": [],
-                    "skipped": True,
-                    "reason": "chat_unfinished",
-                }
-            # Safe to proceed: stop remote worker loop if running (v0 TP deadlock fix)
-            self._prepare_for_poc_gpu_work()
-            return manager.run_batch()
-
-        elif action == "generate_artifacts":
-            # PoC coexistence: chat has priority over PoC GPU work
-            # Check 1: Skip if there's pending input (chat requests waiting)
-            if self.input_socket.poll(timeout=0) != 0:
-                return {
-                    "artifacts": [],
-                    "skipped": True,
-                    "reason": "pending_input",
-                }
-            # Check 2: Skip if we're inside engine.step() (async callback path)
-            if self._engine_step_in_progress:
-                return {
-                    "artifacts": [],
-                    "skipped": True,
-                    "reason": "engine_step_in_progress",
-                }
-            # Check 3: Skip if chat has unfinished requests (still processing)
-            if self.engine.has_unfinished_requests():
-                return {
-                    "artifacts": [],
-                    "skipped": True,
-                    "reason": "chat_unfinished",
-                }
-            # Safe to proceed: stop remote worker loop if running (v0 TP deadlock fix)
-            self._prepare_for_poc_gpu_work()
-            from vllm.poc.data import Artifact
-            artifacts = manager.generate_artifacts(
-                nonces=payload.get("nonces", []),
-                block_hash=payload.get("block_hash", ""),
-                public_key=payload.get("public_key", ""),
-                seq_len=payload.get("seq_len", 256),
-                k_dim=payload.get("k_dim", 12),
-            )
-            return {
-                "artifacts": [{"nonce": a.nonce, "vector_b64": a.vector_b64} for a in artifacts],
-            }
-
-        else:
+        """Process a PoC action and return result.
+        
+        Only supports 'generate_artifacts' action. All PoC state (generation
+        loop, nonce counter, stats) is managed in the API layer.
+        """
+        if action != "generate_artifacts":
             raise ValueError(f"Unknown PoC action: {action}")
+        
+        manager = self._get_poc_manager()
+        
+        # PoC coexistence: chat has priority over PoC GPU work
+        # Check 1: Skip if there's pending input (chat requests waiting)
+        if self.input_socket.poll(timeout=0) != 0:
+            return {
+                "artifacts": [],
+                "skipped": True,
+                "reason": "pending_input",
+            }
+        # Check 2: Skip if we're inside engine.step() (async callback path)
+        if self._engine_step_in_progress:
+            return {
+                "artifacts": [],
+                "skipped": True,
+                "reason": "engine_step_in_progress",
+            }
+        # Check 3: Skip if chat has unfinished requests (still processing)
+        if self.engine.has_unfinished_requests():
+            return {
+                "artifacts": [],
+                "skipped": True,
+                "reason": "chat_unfinished",
+            }
+        # Safe to proceed: stop remote worker loop if running (v0 TP deadlock fix)
+        self._prepare_for_poc_gpu_work()
+        from vllm.poc.data import Artifact
+        artifacts = manager.generate_artifacts(
+            nonces=payload.get("nonces", []),
+            block_hash=payload.get("block_hash", ""),
+            public_key=payload.get("public_key", ""),
+            seq_len=payload.get("seq_len", 256),
+            k_dim=payload.get("k_dim", 12),
+        )
+        return {
+            "artifacts": [{"nonce": a.nonce, "vector_b64": a.vector_b64} for a in artifacts],
+        }
 
     def _health_check(self):
         # Send unhealthy if engine has already errored

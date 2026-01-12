@@ -1184,9 +1184,12 @@ class AsyncLLMEngine(EngineClient):
     async def poc_request(self, action: str, payload: dict) -> dict:
         """Send a PoC (Proof of Compute) request to the engine.
         
-        For AsyncLLMEngine (non-multiprocessing mode), we directly
-        create and use a PoCManager.
+        Only supports 'generate_artifacts' action. All PoC state (generation
+        loop, nonce counter, stats) is managed in the API layer.
         """
+        if action != "generate_artifacts":
+            raise ValueError(f"Unknown PoC action: {action}")
+        
         if not hasattr(self, '_poc_manager'):
             from vllm.poc.manager import PoCManager
             self._poc_manager = PoCManager(
@@ -1197,56 +1200,23 @@ class AsyncLLMEngine(EngineClient):
         
         manager = self._poc_manager
         
-        if action == "init":
-            from vllm.poc.config import PoCConfig
-            config = PoCConfig(**payload)
-            manager.init_round(config)
-            return {"status": "OK", "pow_status": manager.get_status()}
-        
-        elif action == "start_generate":
-            manager.start_generate()
-            return {"status": "OK", "pow_status": manager.get_status()}
-        
-        elif action == "stop":
-            manager.stop_round()
-            return {"status": "OK", "pow_status": manager.get_status()}
-        
-        elif action == "status":
-            return manager.get_status()
-        
-        elif action == "run_batch":
-            # Chat-priority: skip PoC forward if chat has unfinished requests
-            if self.engine.has_unfinished_requests():
-                return {
-                    "should_continue": True,
-                    "state": manager.state.value,
-                    "nonces": [],
-                    "artifacts": [],
-                    "skipped": True,
-                }
-            return manager.run_batch()
-        
-        elif action == "generate_artifacts":
-            # Chat-priority: skip if chat has unfinished requests
-            if self.engine.has_unfinished_requests():
-                return {
-                    "artifacts": [],
-                    "skipped": True,
-                }
-            from vllm.poc.data import Artifact
-            artifacts = manager.generate_artifacts(
-                nonces=payload.get("nonces", []),
-                block_hash=payload.get("block_hash", ""),
-                public_key=payload.get("public_key", ""),
-                seq_len=payload.get("seq_len", 256),
-                k_dim=payload.get("k_dim", 12),
-            )
+        # Chat-priority: skip if chat has unfinished requests
+        if self.engine.has_unfinished_requests():
             return {
-                "artifacts": [{"nonce": a.nonce, "vector_b64": a.vector_b64} for a in artifacts],
+                "artifacts": [],
+                "skipped": True,
             }
-        
-        else:
-            raise ValueError(f"Unknown PoC action: {action}")
+        from vllm.poc.data import Artifact
+        artifacts = manager.generate_artifacts(
+            nonces=payload.get("nonces", []),
+            block_hash=payload.get("block_hash", ""),
+            public_key=payload.get("public_key", ""),
+            seq_len=payload.get("seq_len", 256),
+            k_dim=payload.get("k_dim", 12),
+        )
+        return {
+            "artifacts": [{"nonce": a.nonce, "vector_b64": a.vector_b64} for a in artifacts],
+        }
 
     async def collective_rpc(self,
                              method: str,

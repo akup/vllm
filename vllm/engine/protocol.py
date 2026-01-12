@@ -321,11 +321,11 @@ class EngineClient(ABC):
         """Send a PoC (Proof of Compute) request to the engine.
         
         Args:
-            action: The PoC action to perform ("init", "start_generate",
-                   "stop", "status", "run_batch", "generate_artifacts")
-            payload: Action-specific data
+            action: Only "generate_artifacts" is supported
+            payload: {nonces, block_hash, public_key, seq_len, k_dim}
             
         Returns:
-            Result dictionary from the engine
+            Result dictionary with 'artifacts' list, or 'skipped'=True if
+            chat has priority.
         """
         ...
