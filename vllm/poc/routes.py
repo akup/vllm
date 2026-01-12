@@ -3,6 +3,7 @@ import asyncio
 import os
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Request, HTTPException
@@ -23,6 +24,7 @@ POC_CALLBACK_INTERVAL_SEC = float(os.environ.get("POC_CALLBACK_INTERVAL_SEC", "5
 POC_GENERATE_CHUNK_TIMEOUT_SEC = float(os.environ.get("POC_GENERATE_CHUNK_TIMEOUT_SEC", "60"))
 POC_CHAT_BUSY_BACKOFF_SEC = 0.05
 POC_RPC_TIMEOUT_MS = int(os.environ.get("POC_RPC_TIMEOUT_MS", "60000"))
+POC_BATCH_SIZE_DEFAULT = int(os.environ.get("POC_BATCH_SIZE_DEFAULT", "32"))
 
 _poc_tasks: Dict[int, Dict[str, Any]] = {}
 
@@ -44,9 +46,35 @@ class PoCInitGenerateRequest(BaseModel):
     public_key: str
     node_id: int
     node_count: int
-    batch_size: int = 32
+    group_id: int = 0
+    n_groups: int = 1
+    batch_size: int = POC_BATCH_SIZE_DEFAULT
     params: PoCParamsModel
     url: Optional[str] = None
+
+
+@dataclass
+class NonceIterator:
+    """Iterator for nonces with multi-node and multi-group support."""
+    node_id: int
+    n_nodes: int
+    group_id: int
+    n_groups: int
+    _current_x: int = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> int:
+        offset = self.node_id + self.group_id * self.n_nodes
+        step = self.n_groups * self.n_nodes
+        value = offset + self._current_x * step
+        self._current_x += 1
+        return value
+
+    def take(self, n: int) -> List[int]:
+        """Take the next n nonces."""
+        return [next(self) for _ in range(n)]
 
 
 class ArtifactModel(BaseModel):
@@ -72,7 +100,7 @@ class PoCGenerateRequest(BaseModel):
     node_count: int
     nonces: List[int]
     params: PoCParamsModel
-    batch_size: int = 20
+    batch_size: int = POC_BATCH_SIZE_DEFAULT
     wait: bool = False
     url: Optional[str] = None
     validation: Optional[ValidationModel] = None
@@ -165,6 +193,8 @@ def _get_api_status(app_id: int) -> dict:
             "public_key": config.get("public_key"),
             "node_id": config.get("node_id"),
             "node_count": config.get("node_count"),
+            "group_id": config.get("group_id"),
+            "n_groups": config.get("n_groups"),
             "seq_len": config.get("seq_len"),
             "k_dim": config.get("k_dim"),
         },
@@ -189,14 +219,6 @@ async def _cancel_poc_tasks(app_id: int):
         if tasks.get("callback_sender"):
             tasks["callback_sender"].clear()
 
-
-def _get_next_nonces(nonce_counter: int, batch_size: int, node_count: int) -> tuple:
-    nonces = []
-    counter = nonce_counter
-    for _ in range(batch_size):
-        nonces.append(counter)
-        counter += node_count
-    return nonces, counter
 
 
 async def _compute_artifacts_chunk(
@@ -245,22 +267,27 @@ async def _generation_loop(
     config: dict,
     stats: dict,
 ):
-    nonce_counter = config["node_id"]
+    nonce_iter = NonceIterator(
+        node_id=config["node_id"],
+        n_nodes=config["node_count"],
+        group_id=config["group_id"],
+        n_groups=config["n_groups"],
+    )
     batch_size = config["batch_size"]
-    node_count = config["node_count"]
     
     start_time = time.time()
     stats["start_time"] = start_time
     stats["total_processed"] = 0
     last_report_time = start_time
     
-    logger.info("PoC generation started")
+    logger.info(f"PoC generation started (node {config['node_id']}/{config['node_count']}, group {config['group_id']}/{config['n_groups']})")
     skip_count = 0
     timeout_count = 0
+    pending_nonces = None
     
     try:
         while not stop_event.is_set():
-            nonces, nonce_counter = _get_next_nonces(nonce_counter, batch_size, node_count)
+            nonces = pending_nonces if pending_nonces else nonce_iter.take(batch_size)
             
             try:
                 result = await engine_client.poc_request(
@@ -279,7 +306,7 @@ async def _generation_loop(
                 timeout_count += 1
                 if timeout_count == 1 or timeout_count % 10 == 0:
                     logger.warning(f"PoC timed out (#{timeout_count}), engine busy")
-                nonce_counter -= batch_size * node_count
+                pending_nonces = nonces
                 await asyncio.sleep(POC_CHAT_BUSY_BACKOFF_SEC * 2)
                 continue
             
@@ -287,11 +314,12 @@ async def _generation_loop(
                 skip_count += 1
                 if skip_count % 100 == 1:
                     logger.debug(f"PoC yielding to chat (skip #{skip_count})")
-                nonce_counter -= batch_size * node_count
+                pending_nonces = nonces
                 await asyncio.sleep(POC_CHAT_BUSY_BACKOFF_SEC)
                 continue
             
             skip_count = 0
+            pending_nonces = None
             artifacts = result.get("artifacts", [])
             
             if artifacts and callback_sender:
@@ -343,6 +371,8 @@ async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
         "public_key": body.public_key,
         "node_id": body.node_id,
         "node_count": body.node_count,
+        "group_id": body.group_id,
+        "n_groups": body.n_groups,
         "batch_size": body.batch_size,
         "seq_len": body.params.seq_len,
         "k_dim": body.params.k_dim,

@@ -60,6 +60,7 @@ class CallbackSender:
         """Main sender loop - batches and sends with retry-until-stop."""
         last_send_time = time.time()
         backoff = POC_CALLBACK_RETRY_BACKOFF_SEC
+        retry_attempt = 0
         
         async with aiohttp.ClientSession() as session:
             while not self.stop_event.is_set():
@@ -82,18 +83,25 @@ class CallbackSender:
                         "artifacts": [{"nonce": a.nonce, "vector_b64": a.vector_b64} for a in artifacts_to_send],
                         "encoding": {"dtype": "f16", "k_dim": self.k_dim, "endian": "le"},
                     }
+                    retry_attempt = 0
                 
                 if self._pending_payload:
-                    success = await self._send_callback(session, self._pending_payload)
+                    retry_attempt += 1
+                    success = await self._send_callback(session, self._pending_payload, retry_attempt)
                     if success:
+                        if retry_attempt > 1:
+                            logger.info(f"Callback to {self.callback_url} succeeded after {retry_attempt} attempts")
                         self._pending_payload = None
                         backoff = POC_CALLBACK_RETRY_BACKOFF_SEC
+                        retry_attempt = 0
                         last_send_time = current_time
                     else:
+                        if retry_attempt == 1 or retry_attempt % 10 == 0:
+                            logger.warning(f"Callback to {self.callback_url} failed (attempt {retry_attempt}, next backoff {backoff:.1f}s)")
                         await asyncio.sleep(backoff)
                         backoff = min(backoff * 2, POC_CALLBACK_RETRY_MAX_BACKOFF_SEC)
     
-    async def _send_callback(self, session: aiohttp.ClientSession, payload: Dict) -> bool:
+    async def _send_callback(self, session: aiohttp.ClientSession, payload: Dict, attempt: int = 1) -> bool:
         """Send callback, return True on success."""
         try:
             async with session.post(
@@ -104,10 +112,8 @@ class CallbackSender:
                 if resp.status < 400:
                     logger.debug(f"Callback sent: {len(payload.get('artifacts', []))} artifacts")
                     return True
-                logger.warning(f"Callback HTTP {resp.status}")
                 return False
-        except Exception as e:
-            logger.warning(f"Callback failed: {e}")
+        except Exception:
             return False
 
 
@@ -119,9 +125,11 @@ async def send_oneshot_callback(
 ):
     """Send a single callback with retry-until-stop or success."""
     backoff = POC_CALLBACK_RETRY_BACKOFF_SEC
+    attempt = 0
     
     async with aiohttp.ClientSession() as session:
         while True:
+            attempt += 1
             if stop_event and stop_event.is_set():
                 return False
             
@@ -132,10 +140,14 @@ async def send_oneshot_callback(
                     timeout=aiohttp.ClientTimeout(total=10)
                 ) as resp:
                     if resp.status < 400:
+                        if attempt > 1:
+                            logger.info(f"Callback to {url}/{path} succeeded after {attempt} attempts")
                         return True
-                    logger.warning(f"Oneshot callback HTTP {resp.status}")
+                    if attempt == 1 or attempt % 10 == 0:
+                        logger.warning(f"Callback to {url}/{path} HTTP {resp.status} (attempt {attempt}, next backoff {backoff:.1f}s)")
             except Exception as e:
-                logger.warning(f"Oneshot callback failed: {e}")
+                if attempt == 1 or attempt % 10 == 0:
+                    logger.warning(f"Callback to {url}/{path} failed: {e} (attempt {attempt}, next backoff {backoff:.1f}s)")
             
             if stop_event is None:
                 return False

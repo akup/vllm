@@ -6,7 +6,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from vllm.poc.routes import router, _poc_tasks, _is_generation_active, _get_next_nonces
+from vllm.poc.routes import (
+    router, _poc_tasks, _is_generation_active, _get_next_nonces,
+    POC_BATCH_SIZE_DEFAULT, PoCInitGenerateRequest, PoCGenerateRequest,
+    NonceIterator,
+)
 from vllm.poc.generate_queue import GenerateJob, GenerateResult, get_queue, clear_queue, POC_MAX_QUEUED_NONCES
 from vllm.poc.config import PoCState
 
@@ -207,6 +211,47 @@ class TestGenerationLoop:
         assert counter == 12
 
 
+class TestNonceIterator:
+    def test_single_node_single_group(self):
+        it = NonceIterator(node_id=0, n_nodes=1, group_id=0, n_groups=1)
+        assert it.take(5) == [0, 1, 2, 3, 4]
+
+    def test_multi_node_single_group(self):
+        it0 = NonceIterator(node_id=0, n_nodes=3, group_id=0, n_groups=1)
+        it1 = NonceIterator(node_id=1, n_nodes=3, group_id=0, n_groups=1)
+        it2 = NonceIterator(node_id=2, n_nodes=3, group_id=0, n_groups=1)
+        assert it0.take(3) == [0, 3, 6]
+        assert it1.take(3) == [1, 4, 7]
+        assert it2.take(3) == [2, 5, 8]
+
+    def test_multi_group(self):
+        # 2 nodes, 2 groups: step = 2*2 = 4
+        # group 0, node 0: offset=0, nonces: 0, 4, 8, 12...
+        # group 0, node 1: offset=1, nonces: 1, 5, 9, 13...
+        # group 1, node 0: offset=2, nonces: 2, 6, 10, 14...
+        # group 1, node 1: offset=3, nonces: 3, 7, 11, 15...
+        it_g0_n0 = NonceIterator(node_id=0, n_nodes=2, group_id=0, n_groups=2)
+        it_g0_n1 = NonceIterator(node_id=1, n_nodes=2, group_id=0, n_groups=2)
+        it_g1_n0 = NonceIterator(node_id=0, n_nodes=2, group_id=1, n_groups=2)
+        it_g1_n1 = NonceIterator(node_id=1, n_nodes=2, group_id=1, n_groups=2)
+        assert it_g0_n0.take(4) == [0, 4, 8, 12]
+        assert it_g0_n1.take(4) == [1, 5, 9, 13]
+        assert it_g1_n0.take(4) == [2, 6, 10, 14]
+        assert it_g1_n1.take(4) == [3, 7, 11, 15]
+
+    def test_all_nonces_disjoint(self):
+        # 3 nodes, 2 groups = 6 total iterators covering all nonces
+        all_nonces = set()
+        for group_id in range(2):
+            for node_id in range(3):
+                it = NonceIterator(node_id=node_id, n_nodes=3, group_id=group_id, n_groups=2)
+                nonces = it.take(10)
+                assert len(set(nonces) & all_nonces) == 0, "Nonces overlap!"
+                all_nonces.update(nonces)
+        # Should cover 0..59 exactly
+        assert all_nonces == set(range(60))
+
+
 class TestGenerateQueue:
     def test_poll_unknown_request_returns_404(self, client):
         assert client.get("/api/v1/pow/generate/unknown-id").status_code == 404
@@ -253,3 +298,32 @@ class TestGenerateQueueIntegration:
         )
         result = await queue._process_job(job)
         assert result["status"] == "completed"
+
+
+class TestBatchSizeDefaults:
+    def test_batch_size_default_constant_exists(self):
+        assert POC_BATCH_SIZE_DEFAULT == 32
+
+    def test_init_generate_uses_batch_size_default(self):
+        req = PoCInitGenerateRequest(
+            block_hash="abc", block_height=100, public_key="pk",
+            node_id=0, node_count=1,
+            params={"model": "test", "seq_len": 256, "k_dim": 12},
+        )
+        assert req.batch_size == POC_BATCH_SIZE_DEFAULT
+
+    def test_generate_uses_batch_size_default(self):
+        req = PoCGenerateRequest(
+            block_hash="abc", block_height=100, public_key="pk",
+            node_id=0, node_count=1, nonces=[0, 1],
+            params={"model": "test", "seq_len": 256, "k_dim": 12},
+        )
+        assert req.batch_size == POC_BATCH_SIZE_DEFAULT
+
+    def test_batch_size_can_be_overridden(self):
+        req = PoCGenerateRequest(
+            block_hash="abc", block_height=100, public_key="pk",
+            node_id=0, node_count=1, nonces=[0, 1], batch_size=100,
+            params={"model": "test", "seq_len": 256, "k_dim": 12},
+        )
+        assert req.batch_size == 100
