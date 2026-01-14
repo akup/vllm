@@ -21,9 +21,31 @@ from .gpu_random import (
     random_pick_indices,
     apply_haar_rotation,
 )
+from .layer_hooks import LayerHouseholderHook, poc_forward_context
 
 # Default k_dim (can be overridden per-request)
 DEFAULT_K_DIM = 12
+
+
+def _ensure_layer_hooks(worker, block_hash: str, hidden_size: int) -> None:
+    """Ensure layer hooks are installed on the worker for the given block_hash.
+    
+    Caches hooks on worker._poc_layer_hooks. If block_hash changes, detaches
+    old hooks and installs new ones (per-round transform changes).
+    """
+    model = worker.model_runner.model
+    device = worker.device
+    
+    existing_hook = getattr(worker, '_poc_layer_hooks', None)
+    
+    if existing_hook is not None:
+        if existing_hook.block_hash == block_hash:
+            return
+        existing_hook.detach()
+    
+    hook = LayerHouseholderHook(model, block_hash, device, hidden_size)
+    hook._setup(model, block_hash, device, hidden_size)
+    worker._poc_layer_hooks = hook
 
 
 def _create_prefill_attn_metadata(
@@ -183,14 +205,18 @@ def execute_poc_forward(
     
     torch.cuda.synchronize()
     
-    # Forward pass
+    # Ensure layer hooks are installed for this block_hash (lazy + cached)
+    _ensure_layer_hooks(worker, block_hash, hidden_size)
+    
+    # Forward pass with PoC context (activates layer hook transformations)
     with set_forward_context(attn_metadata, worker_vllm_config):
-        hidden_states = model(
-            input_ids=None,
-            positions=positions.flatten(),
-            intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds.view(-1, hidden_size) if inputs_embeds is not None else None,
-        )
+        with poc_forward_context():
+            hidden_states = model(
+                input_ids=None,
+                positions=positions.flatten(),
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds.view(-1, hidden_size) if inputs_embeds is not None else None,
+            )
     
     # PP: send to next rank if not last
     if not pp_group.is_last_rank:
