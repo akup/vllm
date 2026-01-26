@@ -43,7 +43,6 @@ def start_vllm_server(model: str, log_file: Path) -> subprocess.Popen:
         [
             sys.executable, "-u", "-m", "vllm.entrypoints.openai.api_server",
             "--model", model,
-            "--enable-poc",
             "--port", str(SERVER_PORT),
             "--gpu-memory-utilization", "0.4",
             "--max-model-len", "512",

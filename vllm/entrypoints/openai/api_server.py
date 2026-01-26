@@ -102,6 +102,7 @@ from vllm.utils import (Device, FlexibleArgumentParser, get_open_zmq_ipc_path,
                         is_valid_ipv6_address, set_ulimit)
 from vllm.v1.metrics.prometheus import get_prometheus_registry
 from vllm.version import __version__ as VLLM_VERSION
+from vllm.poc.routes import router as poc_router
 
 prometheus_multiproc_dir: tempfile.TemporaryDirectory
 
@@ -1023,12 +1024,8 @@ def build_app(args: Namespace) -> FastAPI:
     else:
         app = FastAPI(lifespan=lifespan)
     app.include_router(router)
+    app.include_router(poc_router)
     app.root_path = args.root_path
-    
-    # Include PoC router if enabled
-    if getattr(args, 'enable_poc', False):
-        from vllm.poc.routes import router as poc_router
-        app.include_router(poc_router)
 
     mount_metrics(app)
 
@@ -1148,7 +1145,6 @@ async def init_app_state(
     state.engine_client = engine_client
     state.log_stats = not args.disable_log_stats
     state.vllm_config = vllm_config
-    state.poc_enabled = getattr(args, 'enable_poc', False)
     state.max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
     model_config = vllm_config.model_config
 

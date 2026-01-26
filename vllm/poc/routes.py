@@ -118,11 +118,6 @@ async def get_engine_client(request: Request):
     return engine_client
 
 
-async def check_poc_enabled(request: Request):
-    if not getattr(request.app.state, 'poc_enabled', False):
-        raise HTTPException(status_code=503, detail="PoC not enabled")
-
-
 def check_params_match(request: Request, params: PoCParamsModel):
     """Check params match deployed config. Raises 409 on mismatch."""
     serving_models = getattr(request.app.state, 'openai_serving_models', None)
@@ -354,7 +349,7 @@ async def _generation_loop(
 
 @router.post("/init/generate")
 async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
-    await check_poc_enabled(request)
+    logger.info(f"PoC /init/generate: {body.block_hash}, {body.block_height}, {body.public_key}, {body.node_id}, {body.node_count}, {body.group_id}, {body.n_groups}, {body.batch_size}, {body.params}, {body.url}")
     check_params_match(request, body.params)
     engine_client = await get_engine_client(request)
     
@@ -405,7 +400,7 @@ async def init_generate(request: Request, body: PoCInitGenerateRequest) -> dict:
 
 @router.post("/generate")
 async def generate(request: Request, body: PoCGenerateRequest) -> dict:
-    await check_poc_enabled(request)
+    logger.info(f"PoC /generate: {body.block_hash}, {body.block_height}, {body.public_key}, {body.node_id}, {body.node_count}, {body.nonces}, {body.params}, {body.batch_size}, {body.wait}, {body.url}, {body.validation}, {body.stat_test}")
     check_params_match(request, body.params)
     engine_client = await get_engine_client(request)
     
@@ -521,8 +516,6 @@ async def generate(request: Request, body: PoCGenerateRequest) -> dict:
 
 @router.get("/generate/{request_id}")
 async def get_generate_result(request: Request, request_id: str) -> dict:
-    await check_poc_enabled(request)
-    
     queue = get_queue()
     record = queue.get_result(request_id)
     if record is None:
@@ -540,14 +533,11 @@ async def get_generate_result(request: Request, request_id: str) -> dict:
 
 @router.get("/status")
 async def get_status(request: Request) -> dict:
-    await check_poc_enabled(request)
     return _get_api_status(id(request.app))
 
 
 @router.post("/stop")
 async def stop_round(request: Request) -> dict:
-    await check_poc_enabled(request)
-    
     app_id = id(request.app)
     
     await _cancel_poc_tasks(app_id)

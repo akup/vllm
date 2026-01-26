@@ -279,14 +279,6 @@ def make_arg_parser(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         help=
         "If set to True, enable tracking server_load_metrics in the app state."
     )
-    
-    # PoC (Proof of Compute) arguments
-    parser.add_argument(
-        "--enable-poc",
-        action="store_true",
-        default=False,
-        help="Enable Proof of Compute (PoC) endpoints at /api/v1/pow/*.",
-    )
 
     return parser
 

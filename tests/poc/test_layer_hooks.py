@@ -140,7 +140,13 @@ class TestLayerHouseholderHookContextAware:
         device = torch.device("cpu")
         
         hook1 = LayerHouseholderHook(mock_model, "same_hash", device, 64)
+        hook1._setup(mock_model, "same_hash", device, 64)
         hook2 = LayerHouseholderHook(mock_model, "same_hash", device, 64)
+        hook2._setup(mock_model, "same_hash", device, 64)
+        
+        # Verify hooks were actually set up
+        assert len(hook1.reflection_vectors) > 0, "hook1 has no reflection vectors"
+        assert len(hook2.reflection_vectors) > 0, "hook2 has no reflection vectors"
         
         # Reflection vectors should be identical
         for v1, v2 in zip(hook1.reflection_vectors, hook2.reflection_vectors):
@@ -154,7 +160,13 @@ class TestLayerHouseholderHookContextAware:
         device = torch.device("cpu")
         
         hook1 = LayerHouseholderHook(mock_model, "hash_A", device, 64)
+        hook1._setup(mock_model, "hash_A", device, 64)
         hook2 = LayerHouseholderHook(mock_model, "hash_B", device, 64)
+        hook2._setup(mock_model, "hash_B", device, 64)
+        
+        # Verify hooks were actually set up
+        assert len(hook1.reflection_vectors) > 0, "hook1 has no reflection vectors"
+        assert len(hook2.reflection_vectors) > 0, "hook2 has no reflection vectors"
         
         # Reflection vectors should be different
         for v1, v2 in zip(hook1.reflection_vectors, hook2.reflection_vectors):

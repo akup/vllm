@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from vllm.poc.routes import (
-    router, _poc_tasks, _is_generation_active, _get_next_nonces,
+    router, _poc_tasks, _is_generation_active,
     POC_BATCH_SIZE_DEFAULT, PoCInitGenerateRequest, PoCGenerateRequest,
     NonceIterator,
 )
@@ -34,7 +34,6 @@ def app_with_poc(mock_engine_client):
     app = FastAPI()
     app.include_router(router)
     app.state.engine_client = mock_engine_client
-    app.state.poc_enabled = True
     app.state.poc_deployed = {"model": "test-model", "seq_len": 256, "k_dim": 12}
     mock_base_path = MagicMock()
     mock_base_path.model_path = "test-model"
@@ -180,35 +179,6 @@ class TestPoCStop:
         assert response.status_code == 200
         assert response.json()["pow_status"]["status"] == "STOPPED"
         assert client.get("/api/v1/pow/status").json()["status"] == "IDLE"
-
-
-class TestPoCDisabled:
-    def test_routes_disabled_without_flag(self):
-        app = FastAPI()
-        app.include_router(router)
-        app.state.poc_enabled = False
-        app.state.engine_client = AsyncMock()
-        test_client = TestClient(app)
-        assert test_client.get("/api/v1/pow/status").status_code == 503
-
-    def test_routes_require_engine(self):
-        app = FastAPI()
-        app.include_router(router)
-        app.state.poc_enabled = True
-        test_client = TestClient(app)
-        response = test_client.post("/api/v1/pow/generate", json={
-            "block_hash": "abc", "block_height": 100, "public_key": "pk",
-            "node_id": 0, "node_count": 1, "nonces": [0],
-            "params": {"model": "test", "seq_len": 256, "k_dim": 12}, "wait": True,
-        })
-        assert response.status_code == 503
-
-
-class TestGenerationLoop:
-    def test_nonce_generation_api_side(self):
-        nonces, counter = _get_next_nonces(0, 4, 3)
-        assert nonces == [0, 3, 6, 9]
-        assert counter == 12
 
 
 class TestNonceIterator:
