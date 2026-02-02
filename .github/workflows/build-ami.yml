@@ -63,6 +63,9 @@ jobs:
         with:
           version: "1.11.0"
 
+      - name: Install Amazon (amazon-ebs) plugin
+        run: packer plugins install github.com/hashicorp/amazon
+
       - name: Validate Packer template
         run: packer validate -var "aws_region=${{ env.AWS_REGION }}" ami/packer.json
 
