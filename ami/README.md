@@ -80,6 +80,32 @@ Optional: `--field aws_region=us-east-1` `--field instance_type=r6i.4xlarge`
 
 **How to run:** Actions → "Build vLLM base AMI" → "Run workflow". Optionally set `aws_region` (default `us-east-1`) and `instance_type` (default `r6i.4xlarge`). The job has a 4-hour timeout.
 
+#### Build with S3 cache (branch `build-ami`)
+
+A second workflow **Build vLLM base AMI (with S3 cache)** (`.github/workflows/build-ami-cache.yml`) builds the base AMI using `ami/scripts/vllm-build-with-cache.sh`:
+
+- **Final wheel cache:** successful builds upload the wheel to S3; later runs install from it and skip the build.
+- **Intermediate cache:** during the build, `/tmp/vllm-src` is uploaded to S3 **every 10 minutes**. If the run is interrupted (e.g. connection loss), the next run downloads that state and resumes.
+
+Use the **`build-ami`** branch for cache builds. The workflow runs on push to `build-ami` (when `ami/` or the workflow file changes) or manually.
+
+**Required secrets** (in addition to AMI build credentials):
+
+| Secret | Description |
+|--------|-------------|
+| `AWS_AMI_CACHE_BUCKET` | S3 bucket for vLLM wheel + intermediate cache |
+| `AWS_AMI_IAM_PROFILE` | IAM instance profile name for the build instance (S3 access) |
+
+**One-time setup:** Create the bucket and IAM profile with `ami/scripts/setup-cache-bucket.sh`, then add the bucket name and profile name as `AWS_AMI_CACHE_BUCKET` and `AWS_AMI_IAM_PROFILE` in repo secrets.
+
+**Manual run from branch build-ami:**
+
+```bash
+gh workflow run "build-ami-cache.yml" --ref build-ami
+```
+
+Optional: `--field branch=build-ami` `--field aws_region=us-east-1` `--field instance_type=r6i.4xlarge`
+
 ### 2. PoC overlay image (base + vllm/poc + start.sh)
 
 Uses the base AMI (default in `packer-poc.json` is `ami-06fade14c40cef676`). To build with the default base:

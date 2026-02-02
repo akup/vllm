@@ -5,12 +5,17 @@
     "instance_type": "r6i.4xlarge",
     "ami_name": "project-vllm-base-ami-{{timestamp}}",
     "ami_description": "Base AMI with vLLM installed (native, no Docker). No start.sh or PoC overlay; use packer-poc.json to build PoC image.",
-    "python_version": "3.11"
+    "python_version": "3.11",
+    "vllm_build_cache_bucket": "",
+    "vllm_build_cache_prefix": "vllm-wheels",
+    "vllm_build_version": "0.9.1",
+    "iam_instance_profile": ""
   },
   "builders": [
     {
       "type": "amazon-ebs",
       "region": "{{user `aws_region`}}",
+      "iam_instance_profile": "{{user `iam_instance_profile`}}",
       "source_ami_filter": {
         "filters": {
           "virtualization-type": "hvm",
@@ -186,6 +191,19 @@
       "destination": "/tmp/vllm-src/cmake"
     },
     {
+      "type": "file",
+      "source": "ami/scripts/vllm-build-with-cache.sh",
+      "destination": "/tmp/vllm-build-with-cache.sh"
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "echo 'Installing AWS CLI (for S3 cache when vllm_build_cache_bucket is set)...'",
+        "sudo dnf install -y aws-cli || true",
+        "aws --version 2>/dev/null || echo 'aws-cli not installed; S3 cache will be skipped'"
+      ]
+    },
+    {
       "type": "shell",
       "inline": [
         "echo 'Installing PyTorch and build dependencies (required before pip install)...'",
@@ -205,48 +223,55 @@
     {
       "type": "shell",
       "inline": [
-        "echo 'Installing vLLM from local repo (resumable: on failure retry without cleaning so Ninja continues from last object)...'",
+        "echo 'Installing vLLM (from S3 cache if bucket set, else build; with cache: intermediate state uploaded every 10 min)...'",
+        "export VLLM_BUILD_CACHE_BUCKET='{{user `vllm_build_cache_bucket`}}'",
+        "export VLLM_BUILD_CACHE_PREFIX='{{user `vllm_build_cache_prefix`}}'",
+        "export VLLM_BUILD_VERSION='{{user `vllm_build_version`}}'",
+        "export PYVER='{{user `python_version`}}'",
         "export CUDA_HOME=''",
         "for d in /usr/local/cuda-12.8 /usr/local/cuda-12; do [ -x \"$d/bin/nvcc\" ] 2>/dev/null && export CUDA_HOME=$d && break; done",
         "[ -z \"$CUDA_HOME\" ] && for d in /usr/local/cuda-12*; do [ -x \"$d/bin/nvcc\" ] 2>/dev/null && export CUDA_HOME=$d && break; done",
         "[ -z \"$CUDA_HOME\" ] && export CUDA_HOME=/usr/local/cuda",
         "[ -z \"$CUDA_HOME\" ] || [ ! -x \"$CUDA_HOME/bin/nvcc\" ] && { echo 'ERROR: No CUDA toolkit found; PyTorch cu128 requires CUDA 12.8.'; exit 1; }",
-        "echo \"Building vLLM with CUDA_HOME=$CUDA_HOME\"",
         "export PATH=$CUDA_HOME/bin:$PATH",
         "export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}",
         "export TMPDIR=/var/tmp/pip-build",
         "export TMP=/var/tmp/pip-build",
         "export PIP_DEFAULT_TIMEOUT=300",
         "export PIP_TIMEOUT=300",
-        "export PIP_NO_BUILD_ISOLATION=1",
-        "export SETUPTOOLS_SCM_PRETEND_VERSION=0.9.1",
         "export MAX_JOBS=2",
         "export NVCC_THREADS=1",
         "export CMAKE_BUILD_PARALLEL_LEVEL=2",
         "cd /app/vllm-poc",
         "source .venv/bin/activate",
-        "MAX_RETRIES=10",
-        "RETRY_COUNT=0",
-        "while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do",
-        "  cd /tmp/vllm-src",
-        "  set -o pipefail",
-        "  if TMPDIR=/var/tmp/pip-build TMP=/var/tmp/pip-build SETUPTOOLS_SCM_PRETEND_VERSION=0.9.1 MAX_JOBS=2 NVCC_THREADS=1 CMAKE_BUILD_PARALLEL_LEVEL=2 pip install -vv --no-build-isolation . 2>&1 | tee /tmp/vllm-install.log; then",
-        "    echo 'vLLM installation from local repo succeeded'",
-        "    rm -rf /tmp/vllm-src",
-        "    break",
-        "  else",
-        "    RETRY_COUNT=$((RETRY_COUNT + 1))",
-        "    echo 'Last 80 lines of /tmp/vllm-install.log:'",
-        "    tail -80 /tmp/vllm-install.log",
-        "    if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then",
-        "      echo \"Retry $RETRY_COUNT/$MAX_RETRIES: re-running build without cleaning (Ninja will resume from last completed object)...\"",
-        "      sleep 10",
+        "if [ -n \"$VLLM_BUILD_CACHE_BUCKET\" ]; then",
+        "  chmod +x /tmp/vllm-build-with-cache.sh",
+        "  /tmp/vllm-build-with-cache.sh",
+        "else",
+        "  MAX_RETRIES=10",
+        "  RETRY_COUNT=0",
+        "  while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do",
+        "    cd /tmp/vllm-src",
+        "    set -o pipefail",
+        "    TMPDIR=/var/tmp/pip-build TMP=/var/tmp/pip-build SETUPTOOLS_SCM_PRETEND_VERSION=0.9.1 MAX_JOBS=2 NVCC_THREADS=1 CMAKE_BUILD_PARALLEL_LEVEL=2 pip install --no-build-isolation . 2>&1 | tee /tmp/vllm-install.log | grep -v \"Skipping link\" || true",
+        "    if [ ${PIPESTATUS[0]} -eq 0 ]; then",
+        "      echo 'vLLM installation from local repo succeeded'",
+        "      break",
         "    else",
-        "      echo 'ERROR: vLLM installation from local repo failed after retries'",
-        "      exit 1",
+        "      RETRY_COUNT=$((RETRY_COUNT + 1))",
+        "      echo 'Last 80 lines of /tmp/vllm-install.log:'",
+        "      tail -80 /tmp/vllm-install.log",
+        "      if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then",
+        "        echo \"Retry $RETRY_COUNT/$MAX_RETRIES: re-running build without cleaning (Ninja will resume)...\"",
+        "        sleep 10",
+        "      else",
+        "        echo 'ERROR: vLLM installation from local repo failed after retries'",
+        "        exit 1",
+        "      fi",
         "    fi",
-        "  fi",
-        "done"
+        "  done",
+        "fi",
+        "rm -rf /tmp/vllm-src"
       ],
       "timeout": "300m"
     },
