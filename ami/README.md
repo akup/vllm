@@ -61,6 +61,14 @@ Produces `project-vllm-base-ami-<timestamp>`. Contains vLLM + CloudWatch agent; 
 
 A workflow at `.github/workflows/build-ami.yml` builds the base AMI on AWS (manual trigger; run can take up to ~3 hours).
 
+**Manual run from `poc-layers`:** The Actions UI "Run workflow" button only shows workflows on the default branch. If this workflow exists only on `poc-layers`, run it with GitHub CLI:
+
+```bash
+gh workflow run "build-ami.yml" --ref poc-layers
+```
+
+Optional: `--field aws_region=us-east-1` `--field instance_type=r6i.4xlarge`
+
 **Required repository secrets** (Settings → Secrets and variables → Actions):
 
 | Secret | Description |
