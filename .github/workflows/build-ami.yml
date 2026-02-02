@@ -26,10 +26,6 @@ name: Build vLLM base AMI
 on:
   workflow_dispatch:
     inputs:
-      branch:
-        description: "Branch to build (e.g. poc-layers)"
-        required: false
-        default: "poc-layers"
       aws_region:
         description: "AWS region for AMI"
         required: false
