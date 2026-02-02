@@ -69,7 +69,7 @@ if [ -n "${VLLM_BUILD_CACHE_BUCKET}" ]; then
       rm -f /tmp/intermediate.tar.gz
       echo "Restored /tmp/vllm-src; build will resume."
     fi
-    echo "vLLM cache miss; building (final wheel + intermediate state every ${UPLOAD_INTERVAL}s will be uploaded to S3)..."
+    echo "Full vLLM cache miss; building (final wheel + intermediate state every ${UPLOAD_INTERVAL}s will be uploaded to S3)..."
   fi
 fi
 

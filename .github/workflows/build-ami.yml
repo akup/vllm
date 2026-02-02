@@ -44,7 +44,7 @@ jobs:
   build-ami:
     name: Packer build AMI
     runs-on: ubuntu-latest
-    timeout-minutes: 240  # 4 hours (build can take ~3h)
+    timeout-minutes: 300  # 5 hours (build can take ~4h)
     env:
       BUILD_REF: ${{ github.event.inputs.branch || github.ref }}
       AWS_REGION: ${{ github.event.inputs.aws_region || 'us-east-1' }}
