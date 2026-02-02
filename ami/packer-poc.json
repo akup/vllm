@@ -1,0 +1,142 @@
+{
+  "variables": {
+    "aws_region": "us-east-1",
+    "base_ami_id": "ami-06fade14c40cef676",
+    "instance_type": "r6i.2xlarge",
+    "ami_name": "project-vllm-poc-ami-{{timestamp}}",
+    "ami_description": "vLLM PoC overlay AMI: base vLLM + vllm/poc folder + start.sh. Source: project-vllm-base-ami."
+  },
+  "builders": [
+    {
+      "type": "amazon-ebs",
+      "region": "{{user `aws_region`}}",
+      "source_ami": "{{user `base_ami_id`}}",
+      "instance_type": "{{user `instance_type`}}",
+      "ssh_username": "ec2-user",
+      "ssh_pty": true,
+      "ami_name": "{{user `ami_name`}}",
+      "ami_description": "{{user `ami_description`}}",
+      "launch_block_device_mappings": [
+        {
+          "device_name": "/dev/xvda",
+          "volume_size": 100,
+          "volume_type": "gp3",
+          "delete_on_termination": true
+        }
+      ],
+      "tags": {
+        "Name": "{{user `ami_name`}}",
+        "Source": "vLLM PoC overlay (base + poc + start.sh)",
+        "Project": "project-vllm-poc"
+      },
+      "ami_regions": ["{{user `aws_region`}}"],
+      "skip_region_validation": false,
+      "skip_save_build_region": false
+    }
+  ],
+  "provisioners": [
+    {
+      "type": "shell",
+      "inline": [
+        "echo 'Overlay build: copying PoC and start.sh onto base vLLM AMI...'",
+        "test -d /app/vllm-poc/.venv || { echo 'ERROR: Base image missing /app/vllm-poc/.venv'; exit 1; }",
+        "echo 'Base vLLM venv found'"
+      ]
+    },
+    {
+      "type": "file",
+      "source": "ami/start.sh",
+      "destination": "/var/tmp/start.sh"
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "mkdir -p /tmp/poc-overlay"
+      ]
+    },
+    {
+      "type": "file",
+      "source": "vllm/poc/",
+      "destination": "/tmp/poc-overlay"
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "echo 'Copying vllm/poc overlay into installed vLLM...'",
+        "VLLM_POC_DIR='/app/vllm-poc/.venv/lib/python3.11/site-packages/vllm/poc'",
+        "sudo mkdir -p \"$VLLM_POC_DIR\"",
+        "sudo cp -r /tmp/poc-overlay/* \"$VLLM_POC_DIR/\"",
+        "sudo chown -R ec2-user:ec2-user /app/vllm-poc",
+        "rm -rf /tmp/poc-overlay",
+        "echo 'PoC overlay copied'"
+      ]
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "echo 'Setting up start script...'",
+        "sudo mv /var/tmp/start.sh /usr/local/bin/start-vllm-poc.sh",
+        "sudo chmod +x /usr/local/bin/start-vllm-poc.sh",
+        "echo 'Start script: /usr/local/bin/start-vllm-poc.sh'"
+      ]
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "echo 'Setting up environment variables...'",
+        "sudo tee /etc/profile.d/gonka-vllm-poc.sh > /dev/null <<'EOF'",
+        "# Gonka vLLM PoC Environment (native, no Docker)",
+        "export VLLM_USE_V1=0",
+        "export HF_HOME=${HF_HOME:-/home/ec2-user/.cache/huggingface}",
+        "export PATH=\"/app/vllm-poc/.venv/bin:$PATH\"",
+        "EOF",
+        "sudo chmod 644 /etc/profile.d/gonka-vllm-poc.sh",
+        "echo 'Environment configured'"
+      ]
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "echo 'Creating systemd service for vLLM PoC...'",
+        "sudo mkdir -p /var/log/vllm-poc",
+        "sudo chown ec2-user:ec2-user /var/log/vllm-poc",
+        "sudo tee /etc/systemd/system/vllm-poc.service > /dev/null <<'EOF'",
+        "[Unit]",
+        "Description=vLLM PoC Backend (native)",
+        "After=network.target",
+        "",
+        "[Service]",
+        "Type=simple",
+        "User=ec2-user",
+        "WorkingDirectory=/app/vllm-poc",
+        "Environment=\"PATH=/app/vllm-poc/.venv/bin:/usr/local/bin:/usr/bin:/bin\"",
+        "EnvironmentFile=-/etc/profile.d/gonka-vllm-poc.sh",
+        "EnvironmentFile=-/etc/gonka-container.env",
+        "ExecStart=/usr/local/bin/start-vllm-poc.sh",
+        "Restart=on-failure",
+        "RestartSec=10",
+        "StandardOutput=journal",
+        "StandardError=journal",
+        "",
+        "[Install]",
+        "WantedBy=multi-user.target",
+        "EOF",
+        "sudo systemctl daemon-reload",
+        "echo 'Service: vllm-poc.service'"
+      ]
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "echo 'Verifying PoC overlay...'",
+        "cd /app/vllm-poc",
+        "source .venv/bin/activate",
+        "export VLLM_USE_V1=0",
+        "python -c \"import vllm.poc.routes; print('vllm.poc.routes OK')\"",
+        "echo 'PoC overlay AMI build completed successfully!'",
+        "echo 'Start: /usr/local/bin/start-vllm-poc.sh'",
+        "echo 'API: /api/v1/state, /api/v1/pow/init/generate, /api/v1/pow/generate, /api/v1/pow/status, /api/v1/pow/stop'"
+      ]
+    }
+  ]
+}

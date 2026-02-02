@@ -77,6 +77,34 @@ endif()
 # so there is no need to do this explicitly with check_language/enable_language,
 # etc.
 #
+# Workaround: CUDA 13.x / NVTX3-only toolkits may not provide CUDA::nvToolsExt;
+# PyTorch's cuda.cmake expects it. With CUDA 12.x we install cuda-nvtx-12-x and
+# CUDAToolkit may define it; only create a stub when the target still does not exist.
+# See vllm-project/vllm#20892.
+if(NOT TARGET CUDA::nvToolsExt)
+  if(DEFINED ENV{CUDA_HOME} AND NOT DEFINED CUDAToolkit_ROOT)
+    set(CUDAToolkit_ROOT "$ENV{CUDA_HOME}" CACHE PATH "CUDA toolkit root")
+  endif()
+  find_package(CUDAToolkit QUIET)
+endif()
+if(NOT TARGET CUDA::nvToolsExt)
+  set(_nvtools_include "")
+  if(CUDAToolkit_INCLUDE_DIRS)
+    set(_nvtools_include "${CUDAToolkit_INCLUDE_DIRS}")
+  elseif(CUDAToolkit_INCLUDE_DIR)
+    set(_nvtools_include "${CUDAToolkit_INCLUDE_DIR}")
+  elseif(DEFINED ENV{CUDA_HOME} AND EXISTS "$ENV{CUDA_HOME}/include")
+    set(_nvtools_include "$ENV{CUDA_HOME}/include")
+  endif()
+  if(_nvtools_include)
+    add_library(CUDA::nvToolsExt INTERFACE IMPORTED)
+    target_compile_definitions(CUDA::nvToolsExt INTERFACE TORCH_CUDA_USE_NVTX3)
+    target_include_directories(CUDA::nvToolsExt SYSTEM INTERFACE "${_nvtools_include}")
+    target_link_libraries(CUDA::nvToolsExt INTERFACE ${CMAKE_DL_LIBS})
+    message(STATUS "nvToolsExt workaround: CUDA::nvToolsExt -> NVTX3 headers")
+  endif()
+  unset(_nvtools_include)
+endif()
 find_package(Torch REQUIRED)
 
 # Supported NVIDIA architectures.

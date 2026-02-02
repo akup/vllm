@@ -1,0 +1,166 @@
+#!/bin/bash
+set -e
+
+# Start script for vLLM PoC AMI: runs vLLM server natively (no Docker) with PoC backend,
+# compatible with MLNode pow_v2_routes (GET/POST /api/v1/pow/*). Self-contained, fast startup.
+
+# Source environment file if present (e.g. from user-data or /etc/gonka-container.env)
+if [ -f /etc/gonka-container.env ]; then
+    echo "Sourcing /etc/gonka-container.env"
+    set -a
+    source /etc/gonka-container.env
+    set +a
+fi
+source /etc/profile.d/gonka-vllm-poc.sh 2>/dev/null || true
+
+# Required for MLNode registration and FRP
+if [ -z "$API_NODES" ]; then
+    echo "API_NODES is required (comma-separated ip:port)." >&2
+    exit 1
+fi
+if [ -z "$CLIENT_ID" ]; then
+    echo "CLIENT_ID is required (four-digit, e.g. 0001)." >&2
+    exit 1
+fi
+if [[ ! "$CLIENT_ID" =~ ^[0-9]{4}$ ]]; then
+    echo "CLIENT_ID must be a four-digit number (0001-9999)." >&2
+    exit 1
+fi
+if [ -z "$MODEL_NAME" ]; then
+    echo "MODEL_NAME is required for vLLM (e.g. Qwen/Qwen3-8B)." >&2
+    exit 1
+fi
+
+# Optional
+TENSOR_PARALLEL_SIZE=${TENSOR_PARALLEL_SIZE:-1}
+HF_HOME=${HF_HOME:-/home/ec2-user/.cache/huggingface}
+NODE_ID=${NODE_ID:-$CLIENT_ID}
+ID_PREFIX=${ID_PREFIX:-}
+GPU_TYPE=${GPU_TYPE:-nvidia}
+NUM_GPUS=${NUM_GPUS:-1}
+POC_NODE=${POC_NODE:-true}
+REGISTRATION_ENDPOINT=${REGISTRATION_ENDPOINT:-/admin/v1/nodes}
+
+IFS=',' read -ra API_NODES_ARRAY <<< "${API_NODES// /}"
+
+# Ensure venv exists
+if [ ! -f /app/vllm-poc/.venv/bin/python ]; then
+    echo "ERROR: /app/vllm-poc/.venv not found. Run from AMI built with native vLLM." >&2
+    exit 1
+fi
+
+# FRP (optional): if FRP_SERVERS and SECRET_FRP_TOKEN are set, start frpc
+if [ -n "$FRP_SERVERS" ] && [ -n "$SECRET_FRP_TOKEN" ]; then
+    FRP_CONFIG_DIR="${FRP_CONFIG_DIR:-/etc/frp}"
+    mkdir -p "$FRP_CONFIG_DIR"
+    IFS=',' read -ra FRP_SERVERS_ARRAY <<< "${FRP_SERVERS// /}"
+    for i in "${!FRP_SERVERS_ARRAY[@]}"; do
+        server="${FRP_SERVERS_ARRAY[$i]}"
+        FRP_SERVER_IP="${server%%:*}"
+        FRP_SERVER_PORT="${server##*:}"
+        cat > "${FRP_CONFIG_DIR}/frpc${i}.ini" <<EOF
+[common]
+server_addr = ${FRP_SERVER_IP}
+server_port = ${FRP_SERVER_PORT}
+token = ${SECRET_FRP_TOKEN}
+
+[client-mlnode-poc-${CLIENT_ID}]
+type = tcp
+local_ip = 127.0.0.1
+local_port = 8080
+remote_port = 2${CLIENT_ID}
+EOF
+        (command -v frpc &>/dev/null && frpc -c "${FRP_CONFIG_DIR}/frpc${i}.ini" &) || true
+    done
+fi
+
+# Build vLLM run args (native process, no Docker)
+export VLLM_USE_V1=0
+export HF_HOME
+VLLM_ARGS="--model $MODEL_NAME --port 8080 --host 0.0.0.0"
+if [ -n "$TENSOR_PARALLEL_SIZE" ] && [ "$TENSOR_PARALLEL_SIZE" -gt 1 ]; then
+    VLLM_ARGS="$VLLM_ARGS --tensor-parallel-size $TENSOR_PARALLEL_SIZE"
+fi
+
+# Start vLLM natively in background (PoC routes are in the overlay)
+mkdir -p "$HF_HOME"
+echo "Starting vLLM PoC server natively (port 8080)..."
+/app/vllm-poc/.venv/bin/python -m vllm.entrypoints.openai.api_server $VLLM_ARGS &
+VLLM_PID=$!
+echo "vLLM started (PID $VLLM_PID). Waiting for /api/v1/state..."
+
+# Wait for vLLM to be ready
+max_attempts=180
+attempt=0
+while [ $attempt -lt $max_attempts ]; do
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 --connect-timeout 1 "http://127.0.0.1:8080/api/v1/state" 2>/dev/null || echo "000")
+    if [ "$HTTP_CODE" = "200" ]; then
+        echo "vLLM is ready (HTTP $HTTP_CODE)."
+        break
+    fi
+    attempt=$((attempt + 1))
+    sleep 2
+done
+if [ $attempt -eq $max_attempts ]; then
+    echo "WARNING: vLLM may not be ready yet." >&2
+fi
+
+# Register with MLNode API (so pow_v2_routes can discover this backend)
+REGISTRATION_JSON=${REGISTRATION_JSON:-}
+if [ -z "$REGISTRATION_JSON" ]; then
+  REGISTRATION_JSON='{
+   "id": "'${ID_PREFIX}${NODE_ID}'",
+   "host": "frps",
+   "inference_port": 1'${CLIENT_ID}',
+   "poc_port": 2'${CLIENT_ID}',
+   "max_concurrent": 500,
+   "models": {
+     "'$MODEL_NAME'": {
+       "args": ["--tensor-parallel-size","'$TENSOR_PARALLEL_SIZE'"]
+     }
+   },
+   "poc_hw": {
+     "type": "'${GPU_TYPE}'",
+     "num": '${NUM_GPUS}'
+   },
+   "access": true
+ }'
+fi
+for API_NODE in "${API_NODES_ARRAY[@]}"; do
+  echo "Registering with API at ${API_NODE}"
+  echo "$REGISTRATION_JSON" | curl -s -X POST "http://${API_NODE}${REGISTRATION_ENDPOINT}" \
+    -H "Content-Type: application/json" -d @- || true
+done
+
+# Optionally report GPU devices to API
+GPU_DEVICES=$(curl -s "http://127.0.0.1:8080/api/v1/gpu/devices" 2>/dev/null || echo "{}")
+if [ -n "$GPU_DEVICES" ] && [ "$GPU_DEVICES" != "{}" ]; then
+  if command -v jq &>/dev/null; then
+    GPU_DEVICES_WITH_ACCESS=$(echo "$GPU_DEVICES" | jq '. + {"access": true}')
+  else
+    GPU_DEVICES_WITH_ACCESS=$(echo "$GPU_DEVICES" | python3 -c "import sys,json; d=json.load(sys.stdin); d['access']=True; print(json.dumps(d))" 2>/dev/null) || echo "$GPU_DEVICES"
+  fi
+  for API_NODE in "${API_NODES_ARRAY[@]}"; do
+    echo "$GPU_DEVICES_WITH_ACCESS" | curl -s -X POST "http://${API_NODE}/admin/v1/nodes/${NODE_ID}/hardware" \
+      -H "Content-Type: application/json" -d @- || true
+  done
+fi
+
+# POC init: get init_generate from API and POST to local /api/v1/pow/init/generate
+if [ "${POC_NODE}" = "true" ]; then
+  FIRST_API_NODE="${API_NODES_ARRAY[0]}"
+  echo "Requesting init_generate from API: ${FIRST_API_NODE}"
+  INIT_RESPONSE=$(curl -s --max-time 30 "http://${FIRST_API_NODE}/admin/v1/poc_init/${CLIENT_ID}?access=true" 2>/dev/null || echo "{}")
+  INIT_GENERATE_JSON=$(echo "$INIT_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(json.dumps(d.get('init_generate') or {}))" 2>/dev/null || echo "")
+  if [ -n "$INIT_GENERATE_JSON" ] && [ "$INIT_GENERATE_JSON" != "null" ] && [ "$INIT_GENERATE_JSON" != "{}" ]; then
+    echo "Posting init_generate to local /api/v1/pow/init/generate"
+    HTTP_CODE=$(curl -s -o /tmp/pow_init_response.json -w "%{http_code}" --max-time 30 -X POST "http://127.0.0.1:8080/api/v1/pow/init/generate" \
+      -H "Content-Type: application/json" -d "$INIT_GENERATE_JSON" 2>/dev/null || echo "000")
+    echo "Local pow/init/generate HTTP $HTTP_CODE"
+    rm -f /tmp/pow_init_response.json
+  fi
+fi
+
+echo "vLLM PoC backend is running (native, no Docker). MLNode can proxy to this instance (e.g. poc_port 2${CLIENT_ID} via FRP)."
+echo "Waiting for vLLM process..."
+wait $VLLM_PID 2>/dev/null || true
