@@ -9,6 +9,7 @@
     "vllm_build_cache_bucket": "",
     "vllm_build_cache_prefix": "vllm-wheels",
     "vllm_build_version": "0.9.1",
+    "vllm_build_verbose": "1",
     "iam_instance_profile": ""
   },
   "builders": [
@@ -19,10 +20,11 @@
       "source_ami_filter": {
         "filters": {
           "virtualization-type": "hvm",
-          "name": "Deep Learning OSS Nvidia Driver AMI GPU PyTorch 2.9 (Amazon Linux 2023)*",
-          "root-device-type": "ebs"
+          "name": "project-vllm-prereq-ami-*",
+          "root-device-type": "ebs",
+          "state": "available"
         },
-        "owners": ["amazon"],
+        "owners": ["self"],
         "most_recent": true
       },
       "source_ami": "{{user `source_image`}}",
@@ -56,92 +58,7 @@
     {
       "type": "shell",
       "inline": [
-        "echo 'Updating system packages...'",
-        "sudo dnf update -y",
-        "sudo dnf clean all",
-        "echo 'System update completed'"
-      ]
-    },
-    {
-      "type": "shell",
-      "inline": [
-        "echo 'Configuring SSH server for long builds (reduce connection drops)...'",
-        "sudo sed -i -e 's/^#\\?ClientAliveInterval.*/ClientAliveInterval 60/' -e 's/^#\\?ClientAliveCountMax.*/ClientAliveCountMax 120/' /etc/ssh/sshd_config",
-        "grep -q '^ClientAliveInterval' /etc/ssh/sshd_config || echo 'ClientAliveInterval 60' | sudo tee -a /etc/ssh/sshd_config",
-        "grep -q '^ClientAliveCountMax' /etc/ssh/sshd_config || echo 'ClientAliveCountMax 120' | sudo tee -a /etc/ssh/sshd_config",
-        "sudo systemctl reload sshd || true",
-        "echo 'SSH keepalive: 60s interval, 120 max (2h before server would drop)'"
-      ]
-    },
-    {
-      "type": "shell",
-      "inline": [
-        "echo 'Installing CUDA 12.8 toolkit (required for PyTorch cu128)...'",
-        "sudo dnf install -y dnf-plugins-core",
-        "sudo dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo || true",
-        "sudo dnf clean all",
-        "sudo dnf install -y cuda-toolkit-12-8 || sudo dnf install -y cuda-12-8 || true",
-        "sudo dnf install -y cuda-nvtx-12-8 cuda-nvtx-devel-12-8 || true",
-        "VLLM_CUDA_DIR=''",
-        "for d in /usr/local/cuda-12.8 /usr/local/cuda-12; do [ -x \"$d/bin/nvcc\" ] 2>/dev/null && VLLM_CUDA_DIR=$d && break; done",
-        "[ -z \"$VLLM_CUDA_DIR\" ] && for d in /usr/local/cuda-12*; do [ -x \"$d/bin/nvcc\" ] 2>/dev/null && VLLM_CUDA_DIR=$d && break; done",
-        "[ -z \"$VLLM_CUDA_DIR\" ] && { echo 'ERROR: CUDA 12.8 not found; PyTorch cu128 requires it.'; exit 1; }",
-        "echo \"Using CUDA for vLLM build: $VLLM_CUDA_DIR\" && $VLLM_CUDA_DIR/bin/nvcc --version"
-      ],
-      "timeout": "45m"
-    },
-    {
-      "type": "shell",
-      "inline": [
-        "echo 'Verifying NVIDIA drivers (pre-installed in DLAMI)...'",
-        "if command -v nvidia-smi &> /dev/null; then",
-        "  echo 'NVIDIA drivers present (from DLAMI)'",
-        "  nvidia-smi --list-gpus 2>/dev/null || echo 'No GPUs on build instance (expected)'",
-        "else",
-        "  echo 'WARNING: NVIDIA drivers not found'",
-        "fi"
-      ]
-    },
-    {
-      "type": "shell",
-      "inline": [
-        "echo 'Installing Python {{user `python_version`}} and build deps...'",
-        "sudo dnf install -y python{{user `python_version`}} python{{user `python_version`}}-devel python{{user `python_version`}}-pip",
-        "sudo dnf install -y gcc gcc-c++ make git wget jq",
-        "python{{user `python_version`}} --version"
-      ]
-    },
-    {
-      "type": "shell",
-      "inline": [
-        "echo 'Installing FRP client...'",
-        "FRP_VERSION=0.65.0",
-        "mkdir -p /tmp/frp && cd /tmp/frp",
-        "wget -qO- \"https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/frp_${FRP_VERSION}_linux_amd64.tar.gz\" | tar -xzf -",
-        "sudo install -m 0755 \"frp_${FRP_VERSION}_linux_amd64/frpc\" /usr/bin/frpc",
-        "rm -rf /tmp/frp",
-        "frpc -v"
-      ]
-    },
-    {
-      "type": "shell",
-      "inline": [
-        "echo 'Creating app directory and venv...'",
-        "sudo mkdir -p /app/vllm-poc",
-        "sudo chown -R ec2-user:ec2-user /app",
-        "mkdir -p /var/tmp/pip-build",
-        "chmod 1777 /var/tmp/pip-build",
-        "cd /app/vllm-poc",
-        "python{{user `python_version`}} -m venv .venv",
-        "source .venv/bin/activate",
-        "pip install --upgrade pip",
-        "echo 'Venv created'"
-      ]
-    },
-    {
-      "type": "shell",
-      "inline": [
-        "echo 'Preparing vLLM source directory...'",
+        "echo 'Preparing vLLM source directory (base image is project-vllm-prereq-ami; CUDA and PyTorch already installed)...'",
         "mkdir -p /tmp/vllm-src"
       ]
     },
@@ -206,27 +123,12 @@
     {
       "type": "shell",
       "inline": [
-        "echo 'Installing PyTorch and build dependencies (required before pip install)...'",
-        "cd /app/vllm-poc",
-        "source .venv/bin/activate",
-        "export TMPDIR=/var/tmp/pip-build",
-        "export TMP=/var/tmp/pip-build",
-        "export PIP_DEFAULT_TIMEOUT=300",
-        "export PIP_TIMEOUT=300",
-        "pip install numpy",
-        "pip install torch==2.7.0 torchaudio==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu128",
-        "pip install -r /tmp/vllm-src/requirements/build.txt",
-        "python -c \"import torch; assert torch.__version__.startswith('2.7'), 'PyTorch must be 2.7.x for vLLM ABI (got ' + torch.__version__ + ')'\"",
-        "echo 'Build dependencies installed (PyTorch 2.7.x, cu128)'"
-      ]
-    },
-    {
-      "type": "shell",
-      "inline": [
-        "echo 'Installing vLLM (from S3 cache if bucket set, else build; with cache: intermediate state uploaded every 10 min)...'",
         "export VLLM_BUILD_CACHE_BUCKET='{{user `vllm_build_cache_bucket`}}'",
         "export VLLM_BUILD_CACHE_PREFIX='{{user `vllm_build_cache_prefix`}}'",
+        "if [ -n \"$VLLM_BUILD_CACHE_BUCKET\" ]; then echo 'vLLM build cache: ENABLED (bucket='$VLLM_BUILD_CACHE_BUCKET' prefix='${VLLM_BUILD_CACHE_PREFIX:-vllm-wheels}')'; else echo 'vLLM build cache: DISABLED (vllm_build_cache_bucket not set)'; fi",
+        "echo 'Installing vLLM (from S3 cache if bucket set, else build; with cache: intermediate state uploaded every 10 min)...'",
         "export VLLM_BUILD_VERSION='{{user `vllm_build_version`}}'",
+        "export VLLM_BUILD_VERBOSE='{{user `vllm_build_verbose`}}'",
         "export PYVER='{{user `python_version`}}'",
         "export CUDA_HOME=''",
         "for d in /usr/local/cuda-12.8 /usr/local/cuda-12; do [ -x \"$d/bin/nvcc\" ] 2>/dev/null && export CUDA_HOME=$d && break; done",
@@ -251,9 +153,10 @@
         "  MAX_RETRIES=10",
         "  RETRY_COUNT=0",
         "  while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do",
+        "    PIP_VERBOSE_FLAG=''; [ \"$VLLM_BUILD_VERBOSE\" = '2' ] && PIP_VERBOSE_FLAG='-v'",
         "    cd /tmp/vllm-src",
         "    set -o pipefail",
-        "    TMPDIR=/var/tmp/pip-build TMP=/var/tmp/pip-build SETUPTOOLS_SCM_PRETEND_VERSION=0.9.1 MAX_JOBS=2 NVCC_THREADS=1 CMAKE_BUILD_PARALLEL_LEVEL=2 pip install --no-build-isolation . 2>&1 | tee /tmp/vllm-install.log | grep -v \"Skipping link\" || true",
+        "    TMPDIR=/var/tmp/pip-build TMP=/var/tmp/pip-build SETUPTOOLS_SCM_PRETEND_VERSION=0.9.1 MAX_JOBS=2 NVCC_THREADS=1 CMAKE_BUILD_PARALLEL_LEVEL=2 VERBOSE=$VLLM_BUILD_VERBOSE pip install $PIP_VERBOSE_FLAG --no-build-isolation . 2>&1 | tee /tmp/vllm-install.log | grep -v \"Skipping link\" || true",
         "    if [ ${PIPESTATUS[0]} -eq 0 ]; then",
         "      echo 'vLLM installation from local repo succeeded'",
         "      break",

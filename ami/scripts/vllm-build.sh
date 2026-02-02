@@ -31,7 +31,8 @@ export VERBOSE="${VLLM_BUILD_VERBOSE:-1}"
 RETRY=0
 export PYTHONUNBUFFERED=1
 while [ $RETRY -lt $MAX_RETRIES ]; do
-  pip wheel --no-build-isolation -w "$WHEELS_DIR" . 2>&1 | tee /tmp/vllm-wheel.log | grep -v "Skipping link" || true
+  PIP_VERBOSE_FLAG=""; [ "${VLLM_BUILD_VERBOSE:-1}" -ge 2 ] && PIP_VERBOSE_FLAG="-v"
+  pip wheel $PIP_VERBOSE_FLAG --no-build-isolation -w "$WHEELS_DIR" . 2>&1 | tee /tmp/vllm-wheel.log | grep -v "Skipping link" || true
   if [ ${PIPESTATUS[0]} -eq 0 ]; then
     WHEEL=$(ls "$WHEELS_DIR"/vllm-*.whl 2>/dev/null | head -1)
     [ -z "$WHEEL" ] && { echo "ERROR: No wheel produced."; tail -40 /tmp/vllm-wheel.log; exit 1; }

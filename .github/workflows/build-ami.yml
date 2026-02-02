@@ -1,9 +1,14 @@
-# Build vLLM base AMI on AWS with Packer.
-# Run from repo root; build can take up to ~3 hours.
+# Build vLLM base AMI on AWS via ami/scripts/build-vllm-ami.sh.
+# Builds prereq AMI (CUDA + PyTorch) if none exists in the region, then full base AMI.
+# Uses verbose build and S3 cache (bucket + IAM profile below).
 #
 # Required repository secrets:
-#   AWS_ACCESS_KEY_ID     - IAM access key for EC2/AMI
-#   AWS_SECRET_ACCESS_KEY - IAM secret key
+#   AWS_AMI1_ACCESS_KEY_ID     - IAM access key for EC2/AMI
+#   AWS_AMI1_SECRET_ACCESS_KEY - IAM secret key
+#
+# Optional (for S3 build cache): set to use cache; omit to build without cache.
+#   AWS_AMI_CACHE_BUCKET  - S3 bucket (e.g. gonka-vllm-build-cache)
+#   AWS_AMI_IAM_PROFILE  - IAM instance profile (e.g. PackerVLLMCache)
 #
 # IAM user/role needs: ec2:*, ami:*, iam:PassRole (if using instance profile),
 #   and optionally sts:GetCallerIdentity for debugging.
@@ -66,15 +71,21 @@ jobs:
       - name: Install Amazon (amazon-ebs) plugin
         run: packer plugins install github.com/hashicorp/amazon
 
-      - name: Validate Packer template
-        run: packer validate -var "aws_region=${{ env.AWS_REGION }}" ami/packer.json
-
-      - name: Build AMI
+      - name: Validate Packer templates
         run: |
-          packer build \
-            -var "aws_region=${{ env.AWS_REGION }}" \
-            -var "instance_type=${{ env.PACKER_INSTANCE_TYPE }}" \
-            ami/packer.json
+          packer validate -var "aws_region=${{ env.AWS_REGION }}" ami/packer-prereq.json
+          packer validate -var "aws_region=${{ env.AWS_REGION }}" ami/packer.json
+
+      - name: Build AMI (prereq if missing, then full; verbose + cache)
+        run: |
+          chmod +x ami/scripts/build-vllm-ami.sh
+          ./ami/scripts/build-vllm-ami.sh \
+            --region "${{ env.AWS_REGION }}" \
+            --instance-type "${{ env.PACKER_INSTANCE_TYPE }}" \
+            --verbose 2 \
+            --cache-bucket "${{ secrets.AWS_AMI_CACHE_BUCKET || 'gonka-vllm-build-cache' }}" \
+            --cache-prefix vllm-wheels \
+            --iam-profile "${{ secrets.AWS_AMI_IAM_PROFILE || 'PackerVLLMCache' }}"
 
       - name: Output AMI id (optional)
         if: success()

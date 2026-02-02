@@ -48,14 +48,60 @@ Each instance from this AMI runs vLLM on port **8080**. With FRP, the API reache
 
 Run Packer **from the vLLM repo root**.
 
+### 0. Prereq image (CUDA + PyTorch)
+
+The full base image (`packer.json`) **always** starts from the latest **prereq AMI** (`project-vllm-prereq-ami-*`), so CUDA and PyTorch are not reinstalled. The prereq is found automatically by name in your account.
+
+**Recommended: build both images with one script** (builds prereq if missing, then full base):
+
+```bash
+cd /path/to/vllm
+./ami/scripts/build-vllm-ami.sh
+```
+
+Options: `--region us-east-1`, `--force-prereq` (rebuild prereq), `--prereq-only` (build only prereq), `--skip-prereq` (fail if no prereq), `--verbose 0|1|2` (vLLM build verbosity), `--cache-bucket BUCKET`, `--cache-prefix PREFIX`, `--iam-profile NAME`, `--var KEY=VALUE`.
+
+**Or build manually:** First build the prereq (once per region), then the base image:
+
+```bash
+packer build ami/packer-prereq.json
+packer build ami/packer.json
+```
+
+`packer.json` uses the latest `project-vllm-prereq-ami-*` in the region (by filter). Override with `-var "source_image=ami-XXXXXXXX"` to use a specific AMI.
+
 ### 1. Base image (vLLM only, no start.sh)
 
 ```bash
 cd /path/to/vllm
-packer build ami/packer.json
+./ami/scripts/build-vllm-ami.sh
+# or: packer build ami/packer.json  (requires prereq AMI to exist)
 ```
 
 Produces `project-vllm-base-ami-<timestamp>`. Contains vLLM + CloudWatch agent; no PoC start script.
+
+**Packer variables** (optional):
+
+| Variable | Default | Description |
+|----------|--------|-------------|
+| `vllm_build_verbose` | `1` | vLLM build verbosity: `0` = quiet, `1` = normal (Ninja progress), `2` = verbose |
+| `vllm_build_cache_bucket` | `""` | S3 bucket for wheel/intermediate cache; empty = no cache |
+| `vllm_build_cache_prefix` | `vllm-wheels` | S3 key prefix for cache objects |
+
+**Example: build vLLM verbose** (more CMake/Ninja output):
+
+```bash
+packer build -var "vllm_build_verbose=2" ami/packer.json
+```
+
+**Example: build with S3 cache** (faster re-runs; requires bucket and IAM profile):
+
+```bash
+packer build \
+  -var "vllm_build_cache_bucket=my-vllm-cache" \
+  -var "iam_instance_profile=PackerVLLMCache" \
+  ami/packer.json
+```
 
 #### Build via GitHub Actions
 

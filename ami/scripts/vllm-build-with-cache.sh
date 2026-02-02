@@ -16,7 +16,6 @@ WHEELS_DIR="/tmp/vllm-wheels"
 MAX_RETRIES="${VLLM_BUILD_MAX_RETRIES:-10}"
 UPLOAD_INTERVAL="${VLLM_INTERMEDIATE_UPLOAD_INTERVAL:-600}"
 UPLOAD_PID=""
-UPLOAD_LOG="/tmp/intermediate-upload.log"
 mkdir -p "$WHEELS_DIR"
 
 cleanup_background_upload() {
@@ -36,10 +35,13 @@ upload_intermediate_to_s3() {
   rm -f "$TARFILE"
   ( nice tar -C / -czf "$TARFILE" tmp/vllm-src 2>/dev/null || true
     if [ -s "$TARFILE" ]; then
-      nice aws s3 cp "$TARFILE" "$S3_URI" && echo "[$(date -Iseconds)] Intermediate cache updated." || true
+      SIZE=$(du -h "$TARFILE" | cut -f1)
+      if nice aws s3 cp "$TARFILE" "$S3_URI"; then
+        echo "[$(date -Iseconds)] Cache upload (intermediate, size $SIZE): $S3_URI"
+      fi
     fi
     rm -f "$TARFILE"
-  ) >> "$UPLOAD_LOG" 2>&1
+  )
 }
 
 # Try final wheel from S3 (reuse from a previous successful run)
@@ -49,16 +51,19 @@ if [ -n "${VLLM_BUILD_CACHE_BUCKET}" ]; then
   else
     PREFIX="${VLLM_BUILD_CACHE_PREFIX:-vllm-wheels}"
     S3_URI="s3://${VLLM_BUILD_CACHE_BUCKET}/${PREFIX}/${CACHE_KEY}"
+    echo "Trying to load final wheel cache: $S3_URI"
     if aws s3 cp "$S3_URI" "$WHEELS_DIR/$CACHE_KEY" 2>/dev/null; then
-      echo "vLLM cache hit: $S3_URI (reusing wheel from previous run)"
+      echo "Cache hit (final wheel): $S3_URI"
       pip install "$WHEELS_DIR/$CACHE_KEY"
       echo "vLLM installed from cache."
       exit 0
     fi
     # No final wheel; try intermediate cache (resume after connection loss)
     S3_INTERMEDIATE="s3://${VLLM_BUILD_CACHE_BUCKET}/${PREFIX}/${INTERMEDIATE_KEY}"
+    echo "Trying to load intermediate cache: $S3_INTERMEDIATE"
     if aws s3 cp "$S3_INTERMEDIATE" /tmp/intermediate.tar.gz 2>/dev/null; then
-      echo "Intermediate cache hit: $S3_INTERMEDIATE (resuming from previous run)"
+      SIZE=$(du -h /tmp/intermediate.tar.gz | cut -f1)
+      echo "Cache hit (intermediate, size $SIZE): $S3_INTERMEDIATE"
       rm -rf /tmp/vllm-src
       tar -xzf /tmp/intermediate.tar.gz -C /
       rm -f /tmp/intermediate.tar.gz
@@ -75,21 +80,21 @@ export VERBOSE="${VLLM_BUILD_VERBOSE:-1}"
 RETRY=0
 export PYTHONUNBUFFERED=1
 while [ $RETRY -lt $MAX_RETRIES ]; do
-  # Background: upload intermediate state to S3 every 10 min (log to file so Ninja output stays clean)
+  # Background: upload intermediate state to S3 every 10 min (echo to console)
   if [ -n "${VLLM_BUILD_CACHE_BUCKET}" ] && command -v aws &>/dev/null; then
-    : > "$UPLOAD_LOG"
     (
       while true; do
         sleep "$UPLOAD_INTERVAL"
-        echo "[$(date -Iseconds)] Uploading intermediate build state (log: $UPLOAD_LOG)..."
+        echo "[$(date -Iseconds)] Uploading intermediate build state..."
         upload_intermediate_to_s3
       done
-    ) >> "$UPLOAD_LOG" 2>&1 &
+    ) &
     UPLOAD_PID=$!
-    echo "Background intermediate upload every ${UPLOAD_INTERVAL}s (PID $UPLOAD_PID; log $UPLOAD_LOG)."
+    echo "Background intermediate upload every ${UPLOAD_INTERVAL}s (PID $UPLOAD_PID)."
   fi
 
-  pip wheel --no-build-isolation -w "$WHEELS_DIR" . 2>&1 | tee /tmp/vllm-wheel.log | grep -v "Skipping link" || true
+  PIP_VERBOSE_FLAG=''; [ "${VLLM_BUILD_VERBOSE:-1}" = '2' ] && PIP_VERBOSE_FLAG='-v'
+  pip wheel $PIP_VERBOSE_FLAG --no-build-isolation -w "$WHEELS_DIR" . 2>&1 | tee /tmp/vllm-wheel.log | grep -v "Skipping link" || true
   if [ ${PIPESTATUS[0]} -eq 0 ]; then
     cleanup_background_upload
     WHEEL=$(ls "$WHEELS_DIR"/vllm-*.whl 2>/dev/null | head -1)
