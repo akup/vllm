@@ -8,6 +8,8 @@
     "python_version": "3.11",
     "vllm_build_cache_bucket": "",
     "vllm_build_cache_prefix": "vllm-wheels",
+    "vllm_build_cache_version": "",
+    "vllm_build_overlay_files": "",
     "vllm_build_version": "0.9.1",
     "vllm_build_verbose": "1",
     "iam_instance_profile": ""
@@ -128,6 +130,8 @@
         "if [ -n \"$VLLM_BUILD_CACHE_BUCKET\" ]; then echo 'vLLM build cache: ENABLED (bucket='$VLLM_BUILD_CACHE_BUCKET' prefix='${VLLM_BUILD_CACHE_PREFIX:-vllm-wheels}')'; else echo 'vLLM build cache: DISABLED (vllm_build_cache_bucket not set)'; fi",
         "echo 'Installing vLLM (from S3 cache if bucket set, else build; with cache: intermediate state uploaded every 10 min)...'",
         "export VLLM_BUILD_VERSION='{{user `vllm_build_version`}}'",
+        "export VLLM_BUILD_CACHE_VERSION='{{user `vllm_build_cache_version`}}'",
+        "export VLLM_BUILD_OVERLAY_FILES='{{user `vllm_build_overlay_files`}}'",
         "export VLLM_BUILD_VERBOSE='{{user `vllm_build_verbose`}}'",
         "export PYVER='{{user `python_version`}}'",
         "export CUDA_HOME=''",

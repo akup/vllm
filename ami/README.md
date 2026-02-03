@@ -87,6 +87,7 @@ Produces `project-vllm-base-ami-<timestamp>`. Contains vLLM + CloudWatch agent; 
 | `vllm_build_verbose` | `1` | vLLM build verbosity: `0` = quiet, `1` = normal (Ninja progress), `2` = verbose |
 | `vllm_build_cache_bucket` | `""` | S3 bucket for wheel/intermediate cache; empty = no cache |
 | `vllm_build_cache_prefix` | `vllm-wheels` | S3 key prefix for cache objects |
+| `vllm_build_overlay_files` | `""` | Space-separated paths under repo to apply over cache (e.g. tokenizer fix); only used when cache is enabled |
 
 **Example: build vLLM verbose** (more CMake/Ninja output):
 
@@ -99,6 +100,16 @@ packer build -var "vllm_build_verbose=2" ami/packer.json
 ```bash
 packer build \
   -var "vllm_build_cache_bucket=my-vllm-cache" \
+  -var "iam_instance_profile=PackerVLLMCache" \
+  ami/packer.json
+```
+
+**Example: build with cache and overlay tokenizer fix** (reuse cached wheel but apply current `tokenizer.py`):
+
+```bash
+packer build \
+  -var "vllm_build_cache_bucket=my-vllm-cache" \
+  -var "vllm_build_overlay_files=vllm/transformers_utils/tokenizer.py" \
   -var "iam_instance_profile=PackerVLLMCache" \
   ami/packer.json
 ```

@@ -5,18 +5,62 @@
 # - Intermediate cache: uploaded to S3 every 10 min during build; on connection loss, next run restores and resumes.
 # Requires: venv active, torch installed, /tmp/vllm-src with vllm source.
 # Optional: VLLM_BUILD_VERSION (default 0.9.1), PYVER (default 3.11),
+#   VLLM_BUILD_OVERLAY_FILES (set by Packer var vllm_build_overlay_files; space-separated paths under /tmp/vllm-src to apply over cache; no default),
 #   VLLM_INTERMEDIATE_UPLOAD_INTERVAL (default 600 = 10 min), VLLM_BUILD_VERBOSE (default 1).
 
 set -e
 VERSION="${VLLM_BUILD_VERSION:-0.9.1}"
 PYVER="${PYVER:-3.11}"
-CACHE_KEY="vllm-${VERSION}-cu128-py${PYVER}.whl"
-INTERMEDIATE_KEY="vllm-intermediate-${VERSION}-cu128-py${PYVER}.tar.gz"
+CACHE_SUFFIX="${VLLM_BUILD_CACHE_VERSION:+-$VLLM_BUILD_CACHE_VERSION}"
+CACHE_KEY="vllm-${VERSION}-cu128-py${PYVER}${CACHE_SUFFIX}.whl"
+INTERMEDIATE_KEY="vllm-intermediate-${VERSION}-cu128-py${PYVER}${CACHE_SUFFIX}.tar.gz"
+# Overlay only when Packer sets vllm_build_overlay_files (e.g. tokenizer fix). No default.
+OVERLAY_FILES="${VLLM_BUILD_OVERLAY_FILES:-}"
 WHEELS_DIR="/tmp/vllm-wheels"
 MAX_RETRIES="${VLLM_BUILD_MAX_RETRIES:-10}"
 UPLOAD_INTERVAL="${VLLM_INTERMEDIATE_UPLOAD_INTERVAL:-600}"
 UPLOAD_PID=""
 mkdir -p "$WHEELS_DIR"
+
+# Copy overlay files from /tmp/vllm-src into the installed vLLM (no rebuild).
+apply_overlay_to_installed() {
+  [ -z "$OVERLAY_FILES" ] && return 0
+  VLLM_SITE="$(python -c "import vllm; print(vllm.__path__[0])" 2>/dev/null)" || return 0
+  VLLM_BASE="$(dirname "$VLLM_SITE")"
+  for f in $OVERLAY_FILES; do
+    if [ -f "/tmp/vllm-src/$f" ]; then
+      mkdir -p "$VLLM_BASE/$(dirname "$f")"
+      cp "/tmp/vllm-src/$f" "$VLLM_BASE/$f"
+      echo "Overlay applied: $f -> installed vLLM"
+    fi
+  done
+}
+
+# Save overlay files from current /tmp/vllm-src so we can restore after extracting intermediate.
+save_overlay() {
+  [ -z "$OVERLAY_FILES" ] || [ ! -d /tmp/vllm-src ] && return 0
+  rm -rf /tmp/vllm-overlay
+  mkdir -p /tmp/vllm-overlay
+  for f in $OVERLAY_FILES; do
+    if [ -f "/tmp/vllm-src/$f" ]; then
+      mkdir -p "/tmp/vllm-overlay/$(dirname "$f")"
+      cp "/tmp/vllm-src/$f" "/tmp/vllm-overlay/$f"
+    fi
+  done
+}
+
+# Restore overlay into /tmp/vllm-src (e.g. after extracting intermediate cache).
+restore_overlay() {
+  [ -z "$OVERLAY_FILES" ] || [ ! -d /tmp/vllm-overlay ] && return 0
+  for f in $OVERLAY_FILES; do
+    if [ -f "/tmp/vllm-overlay/$f" ]; then
+      mkdir -p "/tmp/vllm-src/$(dirname "$f")"
+      cp "/tmp/vllm-overlay/$f" "/tmp/vllm-src/$f"
+      echo "Overlay restored: $f (current repo over cache)"
+    fi
+  done
+  rm -rf /tmp/vllm-overlay
+}
 
 cleanup_background_upload() {
   if [ -n "$UPLOAD_PID" ] && kill -0 "$UPLOAD_PID" 2>/dev/null; then
@@ -55,7 +99,8 @@ if [ -n "${VLLM_BUILD_CACHE_BUCKET}" ]; then
     if aws s3 cp "$S3_URI" "$WHEELS_DIR/$CACHE_KEY" 2>/dev/null; then
       echo "Cache hit (final wheel): $S3_URI"
       pip install "$WHEELS_DIR/$CACHE_KEY"
-      echo "vLLM installed from cache."
+      apply_overlay_to_installed
+      echo "vLLM installed from cache (overlay applied if set)."
       exit 0
     fi
     # No final wheel; try intermediate cache (resume after connection loss)
@@ -64,10 +109,12 @@ if [ -n "${VLLM_BUILD_CACHE_BUCKET}" ]; then
     if aws s3 cp "$S3_INTERMEDIATE" /tmp/intermediate.tar.gz 2>/dev/null; then
       SIZE=$(du -h /tmp/intermediate.tar.gz | cut -f1)
       echo "Cache hit (intermediate, size $SIZE): $S3_INTERMEDIATE"
+      save_overlay
       rm -rf /tmp/vllm-src
       tar -xzf /tmp/intermediate.tar.gz -C /
       rm -f /tmp/intermediate.tar.gz
-      echo "Restored /tmp/vllm-src; build will resume."
+      restore_overlay
+      echo "Restored /tmp/vllm-src (overlay applied); build will resume."
     fi
     echo "Full vLLM cache miss; building (final wheel + intermediate state every ${UPLOAD_INTERVAL}s will be uploaded to S3)..."
   fi

@@ -76,7 +76,7 @@ jobs:
           packer validate -var "aws_region=${{ env.AWS_REGION }}" ami/packer-prereq.json
           packer validate -var "aws_region=${{ env.AWS_REGION }}" ami/packer.json
 
-      - name: Build AMI (prereq if missing, then full; verbose + cache)
+      - name: Build AMI (prereq if missing, then full; verbose + cache + overlay)
         run: |
           chmod +x ami/scripts/build-vllm-ami.sh
           ./ami/scripts/build-vllm-ami.sh \
@@ -85,7 +85,8 @@ jobs:
             --verbose 2 \
             --cache-bucket "${{ secrets.AWS_AMI_CACHE_BUCKET || 'gonka-vllm-build-cache' }}" \
             --cache-prefix vllm-wheels \
-            --iam-profile "${{ secrets.AWS_AMI_IAM_PROFILE || 'PackerVLLMCache' }}"
+            --iam-profile "${{ secrets.AWS_AMI_IAM_PROFILE || 'PackerVLLMCache' }}" \
+            --var "vllm_build_overlay_files=vllm/transformers_utils/tokenizer.py"
 
       - name: Output AMI id (optional)
         if: success()

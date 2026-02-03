@@ -91,8 +91,15 @@ def get_cached_tokenizer(tokenizer: AnyTokenizer) -> AnyTokenizer:
 
     tokenizer_all_special_ids = tokenizer.all_special_ids
     tokenizer_all_special_tokens = tokenizer.all_special_tokens
-    tokenizer_all_special_tokens_extended = (
-        tokenizer.all_special_tokens_extended)
+    # HF PreTrainedTokenizerBase has all_special_tokens_extended; some subclasses do not.
+    # Fallback order: all_special_tokens_extended -> additional_special_tokens -> all_special_tokens.
+    tokenizer_all_special_tokens_extended = getattr(
+        tokenizer, "all_special_tokens_extended", None
+    )
+    if tokenizer_all_special_tokens_extended is None:
+        tokenizer_all_special_tokens_extended = getattr(
+            tokenizer, "additional_special_tokens", tokenizer_all_special_tokens
+        )
     tokenizer_vocab = tokenizer.get_vocab()
     tokenizer_len = len(tokenizer)
 
