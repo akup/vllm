@@ -11,8 +11,10 @@
 set -e
 VERSION="${VLLM_BUILD_VERSION:-0.9.1}"
 PYVER="${PYVER:-3.11}"
+# PEP 427 wheel filename: {distribution}-{version}-{py tag}-{abi tag}-{platform}.whl (pip rejects e.g. vllm-0.9.1-cu128-py3.11.whl)
+PY_TAG="cp$(echo "$PYVER" | tr -d .)"
 CACHE_SUFFIX="${VLLM_BUILD_CACHE_VERSION:+-$VLLM_BUILD_CACHE_VERSION}"
-CACHE_KEY="vllm-${VERSION}-cu128-py${PYVER}${CACHE_SUFFIX}.whl"
+CACHE_KEY="vllm-${VERSION}-${PY_TAG}-${PY_TAG}-linux_x86_64${CACHE_SUFFIX}.whl"
 INTERMEDIATE_KEY="vllm-intermediate-${VERSION}-cu128-py${PYVER}${CACHE_SUFFIX}.tar.gz"
 # Overlay only when Packer sets vllm_build_overlay_files (e.g. tokenizer fix). No default.
 OVERLAY_FILES="${VLLM_BUILD_OVERLAY_FILES:-}"
@@ -98,6 +100,15 @@ if [ -n "${VLLM_BUILD_CACHE_BUCKET}" ]; then
     echo "Trying to load final wheel cache: $S3_URI"
     if aws s3 cp "$S3_URI" "$WHEELS_DIR/$CACHE_KEY" 2>/dev/null; then
       echo "Cache hit (final wheel): $S3_URI"
+      pip install "$WHEELS_DIR/$CACHE_KEY"
+      apply_overlay_to_installed
+      echo "vLLM installed from cache (overlay applied if set)."
+      exit 0
+    fi
+    # Fallback: legacy key (invalid wheel filename); save as valid name so pip accepts it
+    LEGACY_KEY="vllm-${VERSION}-cu128-py${PYVER}.whl"
+    if [ "$CACHE_KEY" != "$LEGACY_KEY" ] && aws s3 cp "s3://${VLLM_BUILD_CACHE_BUCKET}/${PREFIX}/${LEGACY_KEY}" "$WHEELS_DIR/$CACHE_KEY" 2>/dev/null; then
+      echo "Cache hit (final wheel, legacy key): $LEGACY_KEY -> $CACHE_KEY"
       pip install "$WHEELS_DIR/$CACHE_KEY"
       apply_overlay_to_installed
       echo "vLLM installed from cache (overlay applied if set)."
