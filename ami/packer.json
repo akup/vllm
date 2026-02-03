@@ -191,7 +191,7 @@
         "export VLLM_USE_V1=0",
         "python -c \"import vllm; print('vllm:', vllm.__file__)\"",
         "python -c \"import vllm.poc.routes; print('vllm.poc.routes OK')\"",
-        "python -m vllm.entrypoints.openai.api_server --help | head -5",
+        "python -m vllm.entrypoints.openai.api_server --device cpu --help | head -5",
         "echo 'Verification OK'"
       ]
     },

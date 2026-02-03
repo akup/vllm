@@ -21,7 +21,7 @@
 #     gh workflow run "build-ami.yml" --ref poc-layers
 #
 #   (Optional inputs: --field branch=poc-layers --field aws_region=us-east-1
-#    --field instance_type=r6i.4xlarge)
+#    --field instance_type=r6i.4xlarge --field clean_cache=true)
 #
 #   Alternatively, merge this file to the default branch; then "Run workflow"
 #   will appear and you can set Branch to "poc-layers" in the form.
@@ -39,6 +39,11 @@ on:
         description: "EC2 instance type for build (r6i.4xlarge default)"
         required: false
         default: "r6i.4xlarge"
+      clean_cache:
+        description: "Delete S3 wheel + intermediate cache before build (full rebuild)"
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   build-ami:
@@ -75,6 +80,21 @@ jobs:
         run: |
           packer validate -var "aws_region=${{ env.AWS_REGION }}" ami/packer-prereq.json
           packer validate -var "aws_region=${{ env.AWS_REGION }}" ami/packer.json
+
+      - name: Clean S3 cache (wheel + intermediate)
+        if: inputs.clean_cache == true
+        env:
+          CACHE_BUCKET: ${{ secrets.AWS_AMI_CACHE_BUCKET || 'gonka-vllm-build-cache' }}
+          CACHE_PREFIX: vllm-wheels
+        run: |
+          if [ -z "$CACHE_BUCKET" ]; then
+            echo "No cache bucket set; nothing to clean."
+            exit 0
+          fi
+          S3_PREFIX="s3://${CACHE_BUCKET}/${CACHE_PREFIX}/"
+          echo "Deleting cache at ${S3_PREFIX}..."
+          aws s3 rm "$S3_PREFIX" --recursive || true
+          echo "Cache cleaned; next build will do a full rebuild."
 
       - name: Build AMI (prereq if missing, then full; verbose + cache + overlay)
         run: |

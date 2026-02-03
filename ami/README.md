@@ -104,7 +104,7 @@ packer build \
   ami/packer.json
 ```
 
-**Example: build with cache and overlay tokenizer fix** (reuse cached wheel but apply current `tokenizer.py`):
+**Example: build with cache and overlay tokenizer fix** (reuse cached wheel but apply current `tokenizer.py`; **required for Qwen models**):
 
 ```bash
 packer build \
@@ -113,6 +113,17 @@ packer build \
   -var "iam_instance_profile=PackerVLLMCache" \
   ami/packer.json
 ```
+
+**Qwen / `all_special_tokens_extended`:** If at runtime you see `Qwen2Tokenizer has no attribute all_special_tokens_extended`, the base AMI was built without the overlay (or from an older build). Either **rebuild the base AMI** with `vllm_build_overlay_files=vllm/transformers_utils/tokenizer.py` (GitHub workflow does this by default), or on the **running instance** copy the fixed file from the repo into the venv:
+
+```bash
+# From your dev machine (repo root), copy fixed tokenizer into the instance’s installed vLLM:
+scp vllm/transformers_utils/tokenizer.py ec2-user@<instance-ip>:/tmp/
+# On the instance:
+sudo cp /tmp/tokenizer.py /app/vllm-poc/.venv/lib64/python3.11/site-packages/vllm/transformers_utils/tokenizer.py
+```
+
+Then restart the vLLM server.
 
 #### Build via GitHub Actions
 
@@ -124,7 +135,19 @@ A workflow at `.github/workflows/build-ami.yml` builds the base AMI on AWS (manu
 gh workflow run "build-ami.yml" --ref poc-layers
 ```
 
-Optional: `--field aws_region=us-east-1` `--field instance_type=r6i.4xlarge`
+Optional: `--field aws_region=us-east-1` `--field instance_type=r6i.4xlarge` `--field clean_cache=true`
+
+**Clean cache (full rebuild):** To force a full vLLM build without reusing S3 wheel/intermediate cache, set **clean_cache** to `true` when running the workflow (or run the AWS CLI below before triggering the workflow). The workflow will delete all objects under the cache prefix, then build from source (with overlay).
+
+```bash
+gh workflow run "build-ami.yml" --ref poc-layers -f clean_cache=true
+```
+
+Or manually delete the cache (same bucket/prefix as the workflow):
+
+```bash
+aws s3 rm s3://gonka-vllm-build-cache/vllm-wheels/ --recursive
+```
 
 **Required repository secrets** (Settings → Secrets and variables → Actions):
 

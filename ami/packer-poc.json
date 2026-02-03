@@ -1,7 +1,7 @@
 {
   "variables": {
     "aws_region": "us-east-1",
-    "base_ami_id": "ami-06fade14c40cef676",
+    "base_ami_id": "ami-05e8f05fb319c3c7f",
     "instance_type": "r6i.2xlarge",
     "ami_name": "project-vllm-poc-ami-{{timestamp}}",
     "ami_description": "vLLM PoC overlay AMI: base vLLM + vllm/poc folder + start.sh. Source: project-vllm-base-ami."
