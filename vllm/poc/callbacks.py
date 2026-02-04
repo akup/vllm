@@ -1,5 +1,8 @@
 """PoC callback sender with retry-until-stop and bounded buffer."""
 import asyncio
+import hashlib
+import hmac
+import json
 import os
 import time
 from collections import deque
@@ -12,10 +15,24 @@ from .data import Artifact
 
 logger = init_logger(__name__)
 
+# Signature key for HMAC-SHA256 (same format as receiver). Override via POC_SIGNATURE_KEY env.
+POC_SIGNATURE_KEY = (os.environ.get("POC_SIGNATURE_KEY") or "SIGNATURE").encode("utf-8")
+
 POC_CALLBACK_INTERVAL_SEC = float(os.environ.get("POC_CALLBACK_INTERVAL_SEC", "5"))
 POC_CALLBACK_MAX_ARTIFACTS = int(os.environ.get("POC_CALLBACK_MAX_ARTIFACTS", "1000000"))
 POC_CALLBACK_RETRY_BACKOFF_SEC = 1.0
 POC_CALLBACK_RETRY_MAX_BACKOFF_SEC = 30.0
+
+
+def _sign_payload(payload: Dict) -> tuple[str, str]:
+    """Return (payload_json, signature) for callback POST."""
+    payload_json = json.dumps(payload, sort_keys=True, separators=(',', ':'))
+    signature = hmac.new(
+        POC_SIGNATURE_KEY,
+        payload_json.encode('utf-8'),
+        hashlib.sha256,
+    ).hexdigest()
+    return payload_json, signature
 
 
 class CallbackSender:
@@ -102,12 +119,18 @@ class CallbackSender:
                         backoff = min(backoff * 2, POC_CALLBACK_RETRY_MAX_BACKOFF_SEC)
     
     async def _send_callback(self, session: aiohttp.ClientSession, payload: Dict, attempt: int = 1) -> bool:
-        """Send callback, return True on success."""
+        """Send callback with HMAC-SHA256 signature, return True on success."""
         try:
+            payload_json, signature = self._sign_payload(payload)
+            headers = {
+                "Content-Type": "application/json",
+                "X-Signature": signature,
+            }
             async with session.post(
                 f"{self.callback_url}/generated",
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=10)
+                data=payload_json,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 if resp.status < 400:
                     logger.debug(f"Callback sent: {len(payload.get('artifacts', []))} artifacts")
@@ -116,28 +139,30 @@ class CallbackSender:
         except Exception:
             return False
 
-
 async def send_oneshot_callback(
     url: str,
     path: str,
     payload: Dict,
     stop_event: Optional[asyncio.Event] = None,
 ):
-    """Send a single callback with retry-until-stop or success."""
+    """Send a single callback with retry-until-stop or success (signed)."""
     backoff = POC_CALLBACK_RETRY_BACKOFF_SEC
     attempt = 0
-    
+    payload_json, signature = _sign_payload(payload)
+    headers = {"Content-Type": "application/json", "X-Signature": signature}
+
     async with aiohttp.ClientSession() as session:
         while True:
             attempt += 1
             if stop_event and stop_event.is_set():
                 return False
-            
+
             try:
                 async with session.post(
                     f"{url}/{path}",
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=10)
+                    data=payload_json,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10),
                 ) as resp:
                     if resp.status < 400:
                         if attempt > 1:

@@ -1,3 +1,7 @@
+import hashlib
+import hmac
+import json
+import os
 import time
 import requests
 from requests.exceptions import RequestException
@@ -16,6 +20,9 @@ from pow.compute.controller import (
 from common.logger import create_logger
 
 logger = create_logger(__name__)
+
+# Signature key for HMAC-SHA256 (same format as receiver expects). Override via POW_SIGNATURE_KEY env.
+SIGNATURE_KEY = (os.environ.get("POW_SIGNATURE_KEY") or "SIGNATURE").encode("utf-8")
 
 
 class Sender(Process):
@@ -55,9 +62,21 @@ class Sender(Process):
         for batch in self.generated_not_sent:
             try:
                 logger.info(f"Sending generated batch to {self.url}")
+                payload = batch.__dict__
+                payload_json = json.dumps(payload, sort_keys=True, separators=(',', ':'))
+                # Sign the exact JSON that will be sent
+                signature = hmac.new(
+                    SIGNATURE_KEY,
+                    payload_json.encode('utf-8'),
+                    hashlib.sha256
+                ).hexdigest()
                 response = requests.post(
                     f"{self.url}/generated",
-                    json=batch.__dict__,
+                    data=payload_json,
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Signature": signature,
+                    },
                 )
                 response.raise_for_status()
                 logger.info("Successfully sent generated batch")
@@ -76,9 +95,21 @@ class Sender(Process):
         for batch in self.validated_not_sent:
             try:
                 logger.info(f"Sending validated batch to {self.url}")
+                payload = batch.__dict__
+                payload_json = json.dumps(payload, sort_keys=True, separators=(',', ':'))
+                # Sign the exact JSON that will be sent
+                signature = hmac.new(
+                    SIGNATURE_KEY,
+                    payload_json.encode('utf-8'),
+                    hashlib.sha256
+                ).hexdigest()
                 response = requests.post(
                     f"{self.url}/validated",
-                    json=batch.__dict__,
+                    data=payload_json,
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Signature": signature,
+                    },
                 )
                 response.raise_for_status()
                 logger.info("Successfully sent validated batch")
