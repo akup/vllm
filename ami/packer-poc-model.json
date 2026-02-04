@@ -1,0 +1,89 @@
+{
+  "variables": {
+    "aws_region": "us-east-1",
+    "poc_ami_id": "ami-02ed784e3e9d3a1b7",
+    "instance_type": "r6i.2xlarge",
+    "ami_name": "project-vllm-poc-model-ami-{{timestamp}}",
+    "ami_description": "vLLM PoC + HF_HOME + pre-downloaded Qwen model. Source: project-vllm-poc-ami.",
+    "hf_model": "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
+  },
+  "builders": [
+    {
+      "type": "amazon-ebs",
+      "region": "{{user `aws_region`}}",
+      "source_ami": "{{user `poc_ami_id`}}",
+      "instance_type": "{{user `instance_type`}}",
+      "ssh_username": "ec2-user",
+      "ssh_pty": true,
+      "ami_name": "{{user `ami_name`}}",
+      "ami_description": "{{user `ami_description`}}",
+      "launch_block_device_mappings": [
+        {
+          "device_name": "/dev/xvda",
+          "volume_size": 100,
+          "volume_type": "gp3",
+          "delete_on_termination": true
+        }
+      ],
+      "tags": {
+        "Name": "{{user `ami_name`}}",
+        "Source": "vLLM PoC + model (HF_HOME + huggingface-cli download)",
+        "Project": "project-vllm-poc-model"
+      },
+      "ami_regions": ["{{user `aws_region`}}"],
+      "skip_region_validation": false,
+      "skip_save_build_region": false
+    }
+  ],
+  "provisioners": [
+    {
+      "type": "shell",
+      "inline": [
+        "echo 'Model overlay: PoC base + HF_HOME + huggingface-cli + model download...'",
+        "test -d /app/vllm-poc/.venv || { echo 'ERROR: Base image missing /app/vllm-poc/.venv'; exit 1; }",
+        "echo 'PoC base found'"
+      ]
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "echo 'Setting HF_HOME and creating cache directory...'",
+        "sudo mkdir -p /data/huggingface",
+        "sudo chown -R ec2-user:ec2-user /data",
+        "sudo tee /etc/profile.d/gonka-hf-home.sh > /dev/null <<'EOF'",
+        "# Hugging Face cache (used by huggingface-cli and vLLM)",
+        "export HF_HOME=/data/huggingface",
+        "EOF",
+        "sudo chmod 644 /etc/profile.d/gonka-hf-home.sh",
+        "echo 'HF_HOME=/data/huggingface configured'"
+      ]
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "echo 'Installing huggingface-cli in PoC venv...'",
+        "sudo -u ec2-user /app/vllm-poc/.venv/bin/pip install --upgrade 'huggingface_hub[cli]'",
+        "sudo -u ec2-user /app/vllm-poc/.venv/bin/huggingface-cli --version",
+        "echo 'huggingface-cli ready'"
+      ]
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "echo 'Downloading model {{user `hf_model`}} (this may take a long time)...'",
+        "sudo -u ec2-user bash -c 'export HF_HOME=/data/huggingface && /app/vllm-poc/.venv/bin/huggingface-cli download {{user `hf_model`}}'",
+        "echo 'Model download completed'"
+      ]
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "echo 'Verifying HF cache...'",
+        "sudo -u ec2-user bash -c 'export HF_HOME=/data/huggingface && ls -la /data/huggingface/hub/models--* 2>/dev/null || ls -la /data/huggingface'",
+        "echo 'PoC + model AMI build completed successfully!'",
+        "echo 'HF_HOME=/data/huggingface (set in /etc/profile.d/gonka-hf-home.sh)'",
+        "echo 'Model: {{user `hf_model`}}'"
+      ]
+    }
+  ]
+}

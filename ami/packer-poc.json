@@ -1,7 +1,7 @@
 {
   "variables": {
     "aws_region": "us-east-1",
-    "base_ami_id": "ami-05e8f05fb319c3c7f",
+    "base_ami_id": "ami-0981d509bf50f86fa",
     "instance_type": "r6i.2xlarge",
     "ami_name": "project-vllm-poc-ami-{{timestamp}}",
     "ami_description": "vLLM PoC overlay AMI: base vLLM + vllm/poc folder + start.sh. Source: project-vllm-base-ami."
@@ -47,6 +47,29 @@
       "type": "file",
       "source": "ami/start.sh",
       "destination": "/var/tmp/start.sh"
+    },
+    {
+      "type": "file",
+      "source": "vllm/model_executor/model_loader/weight_utils.py",
+      "destination": "/var/tmp/weight_utils.py"
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "echo 'Patching installed vLLM with DisabledTqdm fix (weight_utils.py)...'",
+        "WEIGHT_UTILS='vllm/model_executor/model_loader/weight_utils.py'",
+        "for venv_lib in lib64 lib; do",
+        "  DEST=\"/app/vllm-poc/.venv/$venv_lib/python3.11/site-packages/$WEIGHT_UTILS\"",
+        "  if [ -f \"$DEST\" ]; then",
+        "    sudo cp /var/tmp/weight_utils.py \"$DEST\"",
+        "    sudo chown ec2-user:ec2-user \"$DEST\"",
+        "    echo \"Patched $DEST\"",
+        "    break",
+        "  fi",
+        "done",
+        "rm -f /var/tmp/weight_utils.py",
+        "echo 'DisabledTqdm patch applied'"
+      ]
     },
     {
       "type": "shell",

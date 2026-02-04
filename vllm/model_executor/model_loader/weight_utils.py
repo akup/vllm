@@ -75,7 +75,10 @@ enable_hf_transfer()
 class DisabledTqdm(tqdm):
 
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs, disable=True)
+        # Avoid "multiple values for keyword argument 'disable'" when base is
+        # tqdm.asyncio.tqdm_asyncio and caller (e.g. huggingface_hub) already passes disable.
+        kwargs["disable"] = True
+        super().__init__(*args, **kwargs)
 
 
 def get_lock(model_name_or_path: Union[str, Path],

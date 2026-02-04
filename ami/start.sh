@@ -116,7 +116,7 @@ if [ -z "$REGISTRATION_JSON" ]; then
    "max_concurrent": 500,
    "models": {
      "'$MODEL_NAME'": {
-       "args": ["--tensor-parallel-size","'$TENSOR_PARALLEL_SIZE'"]
+       "args": ["--tensor-parallel-size","'$TENSOR_PARALLEL_SIZE'", "--quantization","fp8", "--kv-cache-dtype","fp8"]
      }
    },
    "poc_hw": {
@@ -154,7 +154,17 @@ if [ "${POC_NODE}" = "true" ]; then
   INIT_GENERATE_JSON=$(echo "$INIT_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(json.dumps(d.get('init_generate') or {}))" 2>/dev/null || echo "")
   if [ -n "$INIT_GENERATE_JSON" ] && [ "$INIT_GENERATE_JSON" != "null" ] && [ "$INIT_GENERATE_JSON" != "{}" ]; then
     echo "Posting init_generate to local /api/v1/pow/init/generate"
-    HTTP_CODE=$(curl -s -o /tmp/pow_init_response.json -w "%{http_code}" --max-time 30 -X POST "http://127.0.0.1:8080/api/v1/pow/init/generate" \
+
+    # Use inference endpoint for version v2, else pow endpoint
+    INIT_VERSION=$(echo "$INIT_GENERATE_JSON" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('version', ''))" 2>/dev/null || echo "")
+    if [ "$INIT_VERSION" = "v2" ]; then
+      POW_INIT_ENDPOINT="http://127.0.0.1:8080/api/v1/inference/pow/init/generate"
+    else
+      POW_INIT_ENDPOINT="http://127.0.0.1:8080/api/v1/pow/init/generate"
+    fi
+    echo "Using endpoint: $POW_INIT_ENDPOINT"
+
+    HTTP_CODE=$(curl -s -o /tmp/pow_init_response.json -w "%{http_code}" --max-time 30 -X POST "$POW_INIT_ENDPOINT" \
       -H "Content-Type: application/json" -d "$INIT_GENERATE_JSON" 2>/dev/null || echo "000")
     echo "Local pow/init/generate HTTP $HTTP_CODE"
     rm -f /tmp/pow_init_response.json

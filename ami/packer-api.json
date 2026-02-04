@@ -1,0 +1,141 @@
+{
+  "variables": {
+    "aws_region": "us-east-1",
+    "poc_ami_id": "ami-02ed784e3e9d3a1b7",
+    "instance_type": "r6i.2xlarge",
+    "ami_name": "project-vllm-api-ami-{{timestamp}}",
+    "ami_description": "vLLM API overlay AMI: PoC AMI + MLNode API (uvicorn). Source: project-vllm-poc-ami."
+  },
+  "builders": [
+    {
+      "type": "amazon-ebs",
+      "region": "{{user `aws_region`}}",
+      "source_ami": "{{user `poc_ami_id`}}",
+      "instance_type": "{{user `instance_type`}}",
+      "ssh_username": "ec2-user",
+      "ssh_pty": true,
+      "ami_name": "{{user `ami_name`}}",
+      "ami_description": "{{user `ami_description`}}",
+      "launch_block_device_mappings": [
+        {
+          "device_name": "/dev/xvda",
+          "volume_size": 100,
+          "volume_type": "gp3",
+          "delete_on_termination": true
+        }
+      ],
+      "tags": {
+        "Name": "{{user `ami_name`}}",
+        "Source": "vLLM API overlay (PoC + API)",
+        "Project": "project-vllm-api"
+      },
+      "ami_regions": ["{{user `aws_region`}}"],
+      "skip_region_validation": false,
+      "skip_save_build_region": false
+    }
+  ],
+  "provisioners": [
+    {
+      "type": "shell",
+      "inline": [
+        "echo 'API overlay: PoC base + MLNode API (same stack as Dockerfile app)...'",
+        "test -d /app/vllm-poc/.venv || { echo 'ERROR: Base image missing /app/vllm-poc/.venv'; exit 1; }",
+        "echo 'PoC base found'"
+      ]
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "echo 'Installing system deps for API (Python, build tools)...'",
+        "sudo dnf install -y zlib-devel",
+        "python3.11 --version"
+      ]
+    },
+    {
+      "type": "file",
+      "source": "ami/packages/api",
+      "destination": "/tmp/packages-api"
+    },
+    {
+      "type": "file",
+      "source": "ami/packages/pow",
+      "destination": "/tmp/packages-pow"
+    },
+    {
+      "type": "file",
+      "source": "ami/packages/train",
+      "destination": "/tmp/packages-train"
+    },
+    {
+      "type": "file",
+      "source": "ami/packages/common",
+      "destination": "/tmp/packages-common"
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "echo 'Creating /app/packages layout (api, pow, train, common)...'",
+        "sudo mkdir -p /app/packages/api /app/packages/pow /app/packages/train /app/packages/common",
+        "sudo cp -r /tmp/packages-api/. /app/packages/api/",
+        "sudo cp -r /tmp/packages-pow/. /app/packages/pow/",
+        "sudo cp -r /tmp/packages-train/. /app/packages/train/",
+        "sudo cp -r /tmp/packages-common/. /app/packages/common/",
+        "sudo chown -R ec2-user:ec2-user /app/packages",
+        "rm -rf /tmp/packages-api /tmp/packages-pow /tmp/packages-train /tmp/packages-common",
+        "touch /app/packages/api/src/api/__init__.py /app/packages/pow/src/pow/__init__.py /app/packages/train/src/zeroband/__init__.py /app/packages/common/src/common/__init__.py 2>/dev/null || true",
+        "echo 'Packages copied'"
+      ]
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "echo 'Installing Poetry and API venv (as ec2-user)...'",
+        "sudo -u ec2-user bash -c 'cd /app/packages/api && python3.11 -m venv .venv && . .venv/bin/activate && pip install --upgrade pip && pip install poetry==2.0.1 && poetry install --no-interaction'",
+        "echo 'API venv ready'"
+      ]
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "echo 'Setting up API env (no start script or service; start uvicorn manually for tests)...'",
+        "sudo tee /etc/profile.d/gonka-api.sh > /dev/null <<'EOF'",
+        "# Gonka API Environment",
+        "export PYTHONPATH=\"${PYTHONPATH:-/app:/app/packages/api/src}\"",
+        "# Runner starts vLLM as subprocess; use vLLM venv Python (runner.py uses VLLM_PYTHON_PATH)",
+        "export VLLM_PYTHON_PATH=\"/app/vllm-poc/.venv/bin/python\"",
+        "EOF",
+        "sudo chmod 644 /etc/profile.d/gonka-api.sh",
+        "echo 'Env: /etc/profile.d/gonka-api.sh'"
+      ]
+    },
+    {
+      "type": "file",
+      "source": "ami/scripts/compressa-tests",
+      "destination": "/tmp/compressa-tests"
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "echo 'Copying compressa-tests to /data/...'",
+        "sudo mkdir -p /data",
+        "sudo cp -r /tmp/compressa-tests /data/",
+        "sudo chown -R ec2-user:ec2-user /data/compressa-tests",
+        "rm -rf /tmp/compressa-tests",
+        "echo 'compressa-tests at /data/compressa-tests'"
+      ]
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "echo 'Verifying API install...'",
+        "cd /app/packages/api",
+        "source .venv/bin/activate",
+        "export PYTHONPATH=/app:/app/packages/api/src",
+        "python -c \"import api.app; print('api.app OK')\"",
+        "echo 'API overlay AMI build completed successfully!'",
+        "echo 'Start uvicorn manually: cd /app/packages/api && source .venv/bin/activate && export PYTHONPATH=/app:/app/packages/api/src && python -m uvicorn api.app:app --host 0.0.0.0 --port 8080'",
+        "echo 'Tests: /data/compressa-tests'"
+      ]
+    }
+  ]
+}

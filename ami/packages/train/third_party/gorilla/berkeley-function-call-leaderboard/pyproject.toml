@@ -1,0 +1,13 @@
+[tool.poetry]
+name = "bfcl"
+version = "0.0.0"
+description = "Stub for API AMI when full berkeley-function-call-leaderboard is not present"
+readme = "README.md"
+packages = [{ include = "bfcl", from = "." }]
+
+[tool.poetry.dependencies]
+python = ">=3.10"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

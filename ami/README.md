@@ -2,10 +2,11 @@
 
 AMI that runs **vLLM with the PoC backend** as a **native install** (no Docker). Same stack as `Dockerfile.quick` (vLLM + `vllm/poc` overlay), but installed directly on the instance for **faster startup** (saves ~20–30 seconds vs Docker). MLNode uses it as a PoC backend for `/inference/pow` (pow_v2 routes).
 
-## Two-stage build
+## Build stages
 
 - **Base image** (`packer.json`): Installs vLLM (full repo) in `/app/vllm-poc/.venv`, CloudWatch agent (same logic as gonka pow AMI), FRP, CUDA. **No** `start.sh` or systemd PoC service.
 - **PoC overlay image** (`packer-poc.json`): Starts from the base AMI, copies `vllm/poc` and `start.sh`, sets up profile.d and `vllm-poc.service`. Use this for MLNode PoC backends.
+- **API overlay image** (`packer-api.json`): Starts from the **PoC AMI** (passed by parameter), installs the MLNode API (same stack as `ami/packages/api/Dockerfile` app target) natively: `/app/packages` with api, pow, train, common; Poetry venv at `/app/packages/api/.venv`; start script `/usr/local/bin/start-api.sh` and systemd `vllm-api.service`. No Docker; equivalent to the Docker base `ghcr.io/gonka-ai/vllm:v0.9.1-poc-v2-blackwell` = PoC AMI.
 
 ## What the PoC AMI provides
 
@@ -213,6 +214,34 @@ packer build -var "base_ami_id=$BASE_AMI" ami/packer-poc.json
 
 Produces `project-vllm-poc-ami-<timestamp>` (PoC overlay for MLNode).
 
+### 3. API overlay image (base + MLNode API)
+
+Uses the **PoC AMI** (same logical base as Docker `ghcr.io/gonka-ai/vllm:v0.9.1-poc-v2-blackwell`). Installs the API stack from `ami/packages/api` (api, pow, train, common) natively with Poetry.
+
+```bash
+# Build API overlay (pass your PoC AMI id)
+packer build -var "poc_ami_id=ami-XXXXXXXX" ami/packer-api.json
+```
+
+Or resolve latest PoC AMI:
+
+```bash
+POC_AMI=$(aws ec2 describe-images --owners self \
+  --query 'sort_by(Images,&CreationDate)[-1].ImageId' --output text \
+  --filters "Name=name,Values=project-vllm-poc-ami*")
+packer build -var "poc_ami_id=$POC_AMI" ami/packer-api.json
+```
+
+Produces `project-vllm-api-ami-<timestamp>`. Start API: `/usr/local/bin/start-api.sh` or `systemctl start vllm-api`. PoC (vLLM) remains: `/usr/local/bin/start-vllm-poc.sh` or `systemctl start vllm-poc`.
+
+### Variables (overlay: packer-api.json)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `poc_ami_id` | `ami-0981d509bf50f86fa` | PoC AMI ID (project-vllm-poc-ami-*) |
+| `instance_type` | `r6i.2xlarge` | Instance type for overlay build |
+| `ami_name` | `project-vllm-api-ami-{{timestamp}}` | Output AMI name |
+
 **Connection stability (long builds):** The base build runs 1–2+ hours. The template sets SSH keepalive (client and server) and long read/write timeouts so the connection is less likely to drop. If it still drops, re-run `packer build`; the vLLM build step retries without cleaning, so Ninja resumes from the last completed object.
 
 ### Variables (base: packer.json)
@@ -268,6 +297,7 @@ vllm/
 └── ami/
     ├── packer.json         # Base: vLLM + CloudWatch (no start.sh)
     ├── packer-poc.json     # Overlay: base + vllm/poc + start.sh
+    ├── packer-api.json     # Overlay: PoC AMI + MLNode API (uvicorn)
     ├── start.sh            # Start vLLM process + register + poc init
     ├── setup-cloudwatch-agent.sh
     ├── cloudwatch-agent.service
