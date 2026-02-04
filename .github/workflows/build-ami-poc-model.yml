@@ -1,0 +1,84 @@
+# Build vLLM PoC + model AMI (HF_HOME + huggingface-cli + pre-downloaded model).
+# Uses packer-poc-model.json; source AMI is the PoC AMI (build with build-ami then packer-poc).
+#
+# Required repository secrets:
+#   AWS_AMI1_ACCESS_KEY_ID     - IAM access key for EC2/AMI
+#   AWS_AMI1_SECRET_ACCESS_KEY - IAM secret key
+#
+# Manual run: use "Run workflow" from the Actions tab (workflow must exist on default branch).
+#   Pass the PoC AMI ID (output of packer-poc build) as poc_ami_id.
+
+name: Build vLLM PoC + model AMI
+
+on:
+  workflow_dispatch:
+    inputs:
+      poc_ami_id:
+        description: "Base PoC AMI ID (required; output of packer-poc build)"
+        required: true
+      aws_region:
+        description: "AWS region for AMI"
+        required: false
+        default: "us-east-1"
+      instance_type:
+        description: "EC2 instance type for build"
+        required: false
+        default: "r6i.2xlarge"
+      hf_model:
+        description: "Hugging Face model to download (repo_id)"
+        required: false
+        default: "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
+
+jobs:
+  build-poc-model-ami:
+    name: Packer build PoC + model AMI
+    runs-on: ubuntu-latest
+    timeout-minutes: 480  # 8 hours (model download can be very long)
+    env:
+      AWS_REGION: ${{ github.event.inputs.aws_region || 'us-east-1' }}
+      POC_AMI_ID: ${{ github.event.inputs.poc_ami_id }}
+      PACKER_INSTANCE_TYPE: ${{ github.event.inputs.instance_type || 'r6i.2xlarge' }}
+      HF_MODEL: ${{ github.event.inputs.hf_model || 'Qwen/Qwen3-235B-A22B-Instruct-2507-FP8' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_AMI1_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_AMI1_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Packer
+        uses: hashicorp/setup-packer@main
+        with:
+          version: "1.11.0"
+
+      - name: Install Amazon (amazon-ebs) plugin
+        run: packer plugins install github.com/hashicorp/amazon
+
+      - name: Validate Packer template
+        run: |
+          packer validate \
+            -var "aws_region=${{ env.AWS_REGION }}" \
+            -var "poc_ami_id=${{ env.POC_AMI_ID }}" \
+            -var "instance_type=${{ env.PACKER_INSTANCE_TYPE }}" \
+            -var "hf_model=${{ env.HF_MODEL }}" \
+            ami/packer-poc-model.json
+
+      - name: Build PoC + model AMI
+        run: |
+          packer build \
+            -var "aws_region=${{ env.AWS_REGION }}" \
+            -var "poc_ami_id=${{ env.POC_AMI_ID }}" \
+            -var "instance_type=${{ env.PACKER_INSTANCE_TYPE }}" \
+            -var "hf_model=${{ env.HF_MODEL }}" \
+            ami/packer-poc-model.json
+
+      - name: Output
+        if: success()
+        run: |
+          echo "PoC + model AMI build finished. Check AWS EC2 Console -> AMIs for project-vllm-poc-model-ami-*"
+          echo "HF_HOME=/data/huggingface, model=${{ env.HF_MODEL }}"
