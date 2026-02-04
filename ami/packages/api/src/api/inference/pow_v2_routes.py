@@ -1,5 +1,6 @@
 """PoC v2 routes for MLNode - proxies to vLLM PoC API with multi-backend support."""
 import asyncio
+import time
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException
@@ -69,6 +70,16 @@ class PoCGenerateRequest(BaseModel):
     url: Optional[str] = None
     validation: Optional[ValidationModel] = None
     stat_test: Optional[StatTestModel] = None
+
+
+class PoCThroughputTestRequest(BaseModel):
+    """Request for throughput test: init params only; batch_size and url are controlled by the test."""
+    block_hash: str = "0xthroughput-test"
+    block_height: int = 1
+    public_key: str = "test-pubkey"
+    node_id: int = 0
+    node_count: int = 1
+    params: PoCParamsModel
 
 
 # Endpoints
@@ -247,3 +258,105 @@ async def get_generate_result(request_id: str) -> dict:
         raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+# Throughput test: run generation without callbacks for 2 min per batch_size, then increase batch_size 8 times
+
+THROUGHPUT_TEST_DURATION_SEC = 120
+THROUGHPUT_TEST_BATCH_SIZE_START = 32
+THROUGHPUT_TEST_BATCH_SIZE_INCREMENT = 5
+THROUGHPUT_TEST_NUM_INCREMENTS = 8
+
+
+@router.post("/test/throughput")
+async def test_throughput(body: PoCThroughputTestRequest) -> dict:
+    """
+    PoC v2 throughput test: start generation without sending batches back (no callback).
+    Run for 2 minutes, report total PoCs generated, then increase batch_size by 5 and repeat.
+    Repeats 8 times (batch_size: 32 -> 37 -> 42 -> ... -> 72). Returns results for each run.
+    """
+    backends = get_healthy_backends()
+    if not backends:
+        raise HTTPException(status_code=503, detail="No vLLM backends available")
+
+    n_groups = len(backends)
+    results: List[dict] = []
+    batch_size = THROUGHPUT_TEST_BATCH_SIZE_START
+
+    for run in range(THROUGHPUT_TEST_NUM_INCREMENTS + 1):
+        # Start init/generate with current batch_size, no callback url
+        payload = body.model_dump()
+        payload["batch_size"] = batch_size
+        payload["url"] = None
+        payload["group_id"] = 0
+        payload["n_groups"] = n_groups
+
+        init_errors = []
+        for group_id, port in enumerate(backends):
+            p = {**payload, "group_id": group_id, "n_groups": n_groups}
+            try:
+                r = await call_backend(port, "POST", "/api/v1/pow/init/generate", p)
+                if r.status_code != 200:
+                    init_errors.append({"port": port, "error": r.text})
+            except Exception as e:
+                init_errors.append({"port": port, "error": str(e)})
+
+        if init_errors:
+            for port in backends:
+                try:
+                    await call_backend(port, "POST", "/api/v1/pow/stop", {})
+                except Exception:
+                    pass
+            raise HTTPException(
+                status_code=502,
+                detail={"message": "init/generate failed", "errors": init_errors},
+            )
+
+        # Run for 2 minutes
+        await asyncio.sleep(THROUGHPUT_TEST_DURATION_SEC)
+
+        # Get status from each backend and sum total_processed
+        total_processed = 0
+        total_rate = 0.0
+        for port in backends:
+            try:
+                r = await call_backend(port, "GET", "/api/v1/pow/status")
+                if r.status_code == 200:
+                    data = r.json()
+                    stats = data.get("stats") or {}
+                    total_processed += stats.get("total_processed", 0)
+                    total_rate += stats.get("nonces_per_second", 0.0)
+            except Exception:
+                pass
+
+        # Stop generation before next run
+        for port in backends:
+            try:
+                await call_backend(port, "POST", "/api/v1/pow/stop", {})
+            except Exception:
+                pass
+
+        run_result = {
+            "batch_size": batch_size,
+            "duration_sec": THROUGHPUT_TEST_DURATION_SEC,
+            "total_pocs_generated": total_processed,
+            "nonces_per_second_total": round(total_rate, 2),
+        }
+        results.append(run_result)
+        logger.info(
+            "Throughput test run: batch_size=%s, total_pocs=%s, rate=%.1f/s",
+            batch_size,
+            total_processed,
+            total_rate,
+        )
+
+        batch_size += THROUGHPUT_TEST_BATCH_SIZE_INCREMENT
+
+    return {
+        "status": "OK",
+        "runs": results,
+        "summary": [
+            f"batch_size={r['batch_size']}: {r['total_pocs_generated']} PoCs in {r['duration_sec']}s ({r['nonces_per_second_total']}/s)"
+            for r in results
+        ],
+    }

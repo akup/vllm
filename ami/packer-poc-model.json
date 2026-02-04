@@ -1,7 +1,7 @@
 {
   "variables": {
     "aws_region": "us-east-1",
-    "poc_ami_id": "ami-02ed784e3e9d3a1b7",
+    "poc_ami_id": "ami-0c530e10cc0f6e28f",
     "instance_type": "r6i.2xlarge",
     "ami_name": "project-vllm-poc-model-ami-{{timestamp}}",
     "ami_description": "vLLM PoC + HF_HOME + pre-downloaded Qwen model. Source: project-vllm-poc-ami.",
@@ -20,7 +20,7 @@
       "launch_block_device_mappings": [
         {
           "device_name": "/dev/xvda",
-          "volume_size": 500,
+          "volume_size": 350,
           "volume_type": "gp3",
           "delete_on_termination": true
         }

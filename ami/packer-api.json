@@ -1,7 +1,7 @@
 {
   "variables": {
     "aws_region": "us-east-1",
-    "poc_ami_id": "ami-02ed784e3e9d3a1b7",
+    "poc_ami_id": "ami-05cc311590b8034a8",
     "instance_type": "r6i.2xlarge",
     "ami_name": "project-vllm-api-ami-{{timestamp}}",
     "ami_description": "vLLM API overlay AMI: PoC AMI + MLNode API (uvicorn). Source: project-vllm-poc-ami."
@@ -19,7 +19,7 @@
       "launch_block_device_mappings": [
         {
           "device_name": "/dev/xvda",
-          "volume_size": 100,
+          "volume_size": 500,
           "volume_type": "gp3",
           "delete_on_termination": true
         }
