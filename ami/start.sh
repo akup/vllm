@@ -33,7 +33,7 @@ fi
 
 # Optional
 TENSOR_PARALLEL_SIZE=${TENSOR_PARALLEL_SIZE:-1}
-HF_HOME=${HF_HOME:-/home/ec2-user/.cache/huggingface}
+HF_HOME="/data/huggingface"
 NODE_ID=${NODE_ID:-$CLIENT_ID}
 ID_PREFIX=${ID_PREFIX:-}
 GPU_TYPE=${GPU_TYPE:-nvidia}
@@ -78,8 +78,14 @@ echo "Starting uvicorn application..."
 UVICORN_START_TIME=$(date +%s)
 echo "[$(date +%H:%M:%S)] Uvicorn startup initiated"
 
-source /app/packages/api/.venv/bin/activate
-echo "[$(date +%H:%M:%S)] Python venv activated"
+# API venv is at /app/packages/api/.venv (created by packer-api overlay). PoC-only AMI has no api package.
+if [ -f /app/packages/api/.venv/bin/activate ]; then
+    source /app/packages/api/.venv/bin/activate
+    echo "[$(date +%H:%M:%S)] Python venv activated (/app/packages/api/.venv)"
+else
+    echo "ERROR: /app/packages/api/.venv not found. Run this script on the API AMI (PoC + API overlay), not the PoC-only AMI." >&2
+    exit 1
+fi
 
 # Create log directory for uvicorn if it doesn't exist
 UVICORN_LOG_DIR="${LOG_DIR:-/tmp/logs}"
