@@ -28,7 +28,7 @@ def inference_up(base_url: str, model: str, tensor_parallel_size: Optional[int])
 
     additional_args = []
     if tensor_parallel_size and tensor_parallel_size > 1:
-        additional_args = ["--tensor-parallel-size", str(tensor_parallel_size)]
+        additional_args = ["--tensor-parallel-size", str(tensor_parallel_size), "--quantization", "fp8", "--kv-cache-dtype", "fp8"]
 
     payload = {
         "model": resolve_model(model),

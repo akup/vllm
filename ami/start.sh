@@ -74,35 +74,131 @@ EOF
     done
 fi
 
-# Build vLLM run args (native process, no Docker)
-export VLLM_USE_V1=0
-export HF_HOME
-VLLM_ARGS="--model $MODEL_NAME --port 8080 --host 0.0.0.0"
-if [ -n "$TENSOR_PARALLEL_SIZE" ] && [ "$TENSOR_PARALLEL_SIZE" -gt 1 ]; then
-    VLLM_ARGS="$VLLM_ARGS --tensor-parallel-size $TENSOR_PARALLEL_SIZE"
+echo "Starting uvicorn application..."
+UVICORN_START_TIME=$(date +%s)
+echo "[$(date +%H:%M:%S)] Uvicorn startup initiated"
+
+source /app/packages/api/.venv/bin/activate
+echo "[$(date +%H:%M:%S)] Python venv activated"
+
+# Create log directory for uvicorn if it doesn't exist
+UVICORN_LOG_DIR="${LOG_DIR:-/tmp/logs}"
+mkdir -p "$UVICORN_LOG_DIR"
+
+# Start uvicorn in background with logging to file and stdout
+# Using --log-level debug for application-level details
+# Access logs enabled to see all requests
+# Python application logs will appear in stderr/stdout
+echo "[$(date +%H:%M:%S)] Starting uvicorn with PID tracking and logging..."
+echo "Uvicorn command: PYTHONUNBUFFERED=1 uvicorn pow.service.app:app --host 0.0.0.0 --port 8080 --log-level debug --access-log"
+
+# Start uvicorn and capture both stdout and stderr
+python -m uvicorn api.app:app --host 0.0.0.0 --port 8080 2>&1 | tee "$UVICORN_LOG_DIR/uvicorn.log" &
+UVICORN_PID=$!
+UVICORN_LAUNCH_TIME=$(date +%s)
+LAUNCH_DURATION=$((UVICORN_LAUNCH_TIME - UVICORN_START_TIME))
+echo "[$(date +%H:%M:%S)] Uvicorn process launched (PID: $UVICORN_PID, launch took ${LAUNCH_DURATION}s)"
+echo "Uvicorn logs: $UVICORN_LOG_DIR/uvicorn.log"
+
+# Give uvicorn a moment to start the process
+sleep 1
+
+# Check if process is actually running
+if ! kill -0 $UVICORN_PID 2>/dev/null; then
+    echo "ERROR: Uvicorn process died immediately after start!" >&2
+    if [ -f "$UVICORN_LOG_DIR/uvicorn.log" ]; then
+        echo "Last 50 lines of uvicorn log:" >&2
+        tail -50 "$UVICORN_LOG_DIR/uvicorn.log" >&2
+    fi
+    exit 1
+else
+    echo "[$(date +%H:%M:%S)] Uvicorn process is running (PID: $UVICORN_PID)"
+    # Show initial log output to see startup progress
+    if [ -f "$UVICORN_LOG_DIR/uvicorn.log" ]; then
+        echo "Initial uvicorn log output:"
+        cat "$UVICORN_LOG_DIR/uvicorn.log" 2>/dev/null || echo "Log file empty or not readable"
+    fi
 fi
 
-# Start vLLM natively in background (PoC routes are in the overlay)
-mkdir -p "$HF_HOME"
-echo "Starting vLLM PoC server natively (port 8080)..."
-/app/vllm-poc/.venv/bin/python -m vllm.entrypoints.openai.api_server $VLLM_ARGS &
-VLLM_PID=$!
-echo "vLLM started (PID $VLLM_PID). Waiting for /api/v1/state..."
-
-# Wait for vLLM to be ready
-max_attempts=180
+# Wait for uvicorn to be ready (check if pow/init/generate endpoint is responding)
+echo "Waiting for uvicorn to be ready..."
+READINESS_START_TIME=$(date +%s)
+max_attempts=120
 attempt=0
+LAST_LOG_CHECK=0
+
 while [ $attempt -lt $max_attempts ]; do
-    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 --connect-timeout 1 "http://127.0.0.1:8080/api/v1/state" 2>/dev/null || echo "000")
+    CURRENT_TIME=$(date +%s)
+    ELAPSED=$((CURRENT_TIME - READINESS_START_TIME))
+    
+    # Show progress every 5 seconds
+    if [ $((attempt % 5)) -eq 0 ]; then
+        echo "[$(date +%H:%M:%S)] Attempt $attempt/$max_attempts (elapsed: ${ELAPSED}s)"
+        
+        # Check uvicorn log for startup messages
+        if [ -f "$UVICORN_LOG_DIR/uvicorn.log" ]; then
+            CURRENT_LOG_LINES=$(wc -l < "$UVICORN_LOG_DIR/uvicorn.log" 2>/dev/null || echo "0")
+            if [ "$CURRENT_LOG_LINES" -gt "$LAST_LOG_CHECK" ]; then
+                NEW_LINES=$((CURRENT_LOG_LINES - LAST_LOG_CHECK))
+                echo "  New log lines since last check ($NEW_LINES):"
+                tail -n "$NEW_LINES" "$UVICORN_LOG_DIR/uvicorn.log" | sed 's/^/    /' | tail -5
+                LAST_LOG_CHECK=$CURRENT_LOG_LINES
+            fi
+        fi
+        
+        # Check if uvicorn process is still running
+        if ! kill -0 $UVICORN_PID 2>/dev/null; then
+            echo "ERROR: Uvicorn process (PID: $UVICORN_PID) has died!" >&2
+            if [ -f "$UVICORN_LOG_DIR/uvicorn.log" ]; then
+                echo "Last 50 lines of uvicorn log:" >&2
+                tail -50 "$UVICORN_LOG_DIR/uvicorn.log" >&2
+            fi
+            exit 1
+        fi
+    fi
+    
+    # Test the /api/v1/state endpoint
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+        --max-time 2 \
+        --connect-timeout 1 \
+        "http://127.0.0.1:8080/api/v1/state" 2>/dev/null || echo "000")
+    
     if [ "$HTTP_CODE" = "200" ]; then
-        echo "vLLM is ready (HTTP $HTTP_CODE)."
+        READY_TIME=$(date +%s)
+        TOTAL_STARTUP_TIME=$((READY_TIME - UVICORN_START_TIME))
+        READINESS_WAIT_TIME=$((READY_TIME - READINESS_START_TIME))
+        echo "[$(date +%H:%M:%S)] ✅ Uvicorn is ready! (HTTP status: $HTTP_CODE)"
+        echo "  Total startup time: ${TOTAL_STARTUP_TIME}s"
+        echo "  Readiness check wait: ${READINESS_WAIT_TIME}s"
         break
     fi
+    
     attempt=$((attempt + 1))
-    sleep 2
+    sleep 1
 done
+
 if [ $attempt -eq $max_attempts ]; then
-    echo "WARNING: vLLM may not be ready yet." >&2
+    if [ "${INFERENCE_NODE}" = "true" ]; then
+        echo "WARNING: Uvicorn may not be ready, but proceeding with inference-up call..." >&2
+    else
+        echo "WARNING: Uvicorn may not be ready..." >&2
+    fi
+fi
+
+echo "Calling inference-up.py to load model..."
+if [ -n "$TENSOR_PARALLEL_SIZE" ] && [ "$TENSOR_PARALLEL_SIZE" -gt 1 ]; then
+    python3 /data/compressa-tests/inference-up.py \
+        --model "$MODEL_NAME" \
+        --tensor-parallel-size "$TENSOR_PARALLEL_SIZE" \
+        --base-url "http://localhost:8080" || {
+        echo "WARNING: inference-up.py failed, but continuing..." >&2
+    }
+else
+    python3 /data/compressa-tests/inference-up.py \
+        --model "$MODEL_NAME" \
+        --base-url "http://localhost:8080" || {
+        echo "WARNING: inference-up.py failed, but continuing..." >&2
+    }
 fi
 
 # Register with MLNode API (so pow_v2_routes can discover this backend)
