@@ -61,17 +61,17 @@
     {
       "type": "shell",
       "inline": [
-        "echo 'Installing huggingface-cli in PoC venv...'",
-        "sudo -u ec2-user /app/vllm-poc/.venv/bin/pip install --upgrade 'huggingface_hub[cli]'",
-        "sudo -u ec2-user /app/vllm-poc/.venv/bin/huggingface-cli --version",
-        "echo 'huggingface-cli ready'"
+        "echo 'Installing Hugging Face CLI in PoC venv (upgrade to get hf command)...'",
+        "sudo -u ec2-user /app/vllm-poc/.venv/bin/pip install --upgrade 'huggingface_hub>=1.4'",
+        "sudo -u ec2-user /app/vllm-poc/.venv/bin/hf --version || sudo -u ec2-user /app/vllm-poc/.venv/bin/python -c \"from huggingface_hub import __version__; print('huggingface_hub', __version__)\"",
+        "echo 'Hugging Face CLI / library ready'"
       ]
     },
     {
       "type": "shell",
       "inline": [
         "echo 'Downloading model {{user `hf_model`}} (this may take a long time)...'",
-        "sudo -u ec2-user bash -c 'export HF_HOME=/data/huggingface && /app/vllm-poc/.venv/bin/huggingface-cli download {{user `hf_model`}}'",
+        "sudo -u ec2-user bash -c 'export HF_HOME=/data/huggingface && /app/vllm-poc/.venv/bin/python -c \"from huggingface_hub import snapshot_download; snapshot_download(\\\"{{user `hf_model`}}\\\", cache_dir=\\\"/data/huggingface\\\")\"'",
         "echo 'Model download completed'"
       ]
     },
