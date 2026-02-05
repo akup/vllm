@@ -1,0 +1,17 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "VLLMCacheBucket",
+      "Effect": "Allow",
+      "Action": ["s3:CreateBucket", "s3:ListBucket"],
+      "Resource": "arn:aws:s3:::gonka-vllm-cache"
+    },
+    {
+      "Sid": "VLLMCacheObjects",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject"],
+      "Resource": "arn:aws:s3:::gonka-vllm-cache/vllm-cache/*"
+    }
+  ]
+}

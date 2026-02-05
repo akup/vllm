@@ -1,4 +1,5 @@
 import argparse
+import os
 from typing import Dict, Optional
 
 import requests
@@ -28,7 +29,11 @@ def inference_up(base_url: str, model: str, tensor_parallel_size: Optional[int])
 
     additional_args = []
     if tensor_parallel_size and tensor_parallel_size > 1:
-        additional_args = ["--tensor-parallel-size", str(tensor_parallel_size), "--quantization", "fp8", "--kv-cache-dtype", "fp8"]
+        additional_args = ["--tensor-parallel-size", str(tensor_parallel_size)]
+    additional_args.append("--load-format")
+    additional_args.append("fastsafetensors")
+    additional_args.append("--quantization")
+    additional_args.append("fp8")
 
     payload = {
         "model": resolve_model(model),
@@ -77,6 +82,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    print("HF_HOME=%s" % os.environ.get("HF_HOME", "(unset)"))
     args = parse_args()
 
     if args.tensor_parallel_size is not None and (

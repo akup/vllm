@@ -11,7 +11,7 @@ if [ -f /etc/gonka-container.env ]; then
     source /etc/gonka-container.env
     set +a
 fi
-source /etc/profile.d/gonka-vllm-poc.sh 2>/dev/null || true
+source /etc/profile.d/gonka-api.sh 2>/dev/null || true
 
 # Required for MLNode registration and FRP
 if [ -z "$API_NODES" ]; then
@@ -33,7 +33,7 @@ fi
 
 # Optional
 TENSOR_PARALLEL_SIZE=${TENSOR_PARALLEL_SIZE:-1}
-HF_HOME="/data/huggingface"
+HF_HOME=${HF_HOME:-/home/ec2-user/.cache/huggingface}
 NODE_ID=${NODE_ID:-$CLIENT_ID}
 ID_PREFIX=${ID_PREFIX:-}
 GPU_TYPE=${GPU_TYPE:-nvidia}
@@ -74,29 +74,34 @@ EOF
     done
 fi
 
+# Build vLLM run args (native process, no Docker)
+export VLLM_USE_V1=0
+export HF_HOME="/data/huggingface"
+
+HF_HOME="/data/huggingface"
+TENSOR_PARALLEL_SIZE=4
+MODEL_NAME="Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
+VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-/data/vllm-cache}"
+export VLLM_CACHE_ROOT
+#export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASHINFER}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+unset NCCL_CUMEM_ENABLE 2>/dev/null || true
+
 echo "Starting uvicorn application..."
 UVICORN_START_TIME=$(date +%s)
 echo "[$(date +%H:%M:%S)] Uvicorn startup initiated"
-
-# API venv is at /app/packages/api/.venv (created by packer-api overlay). PoC-only AMI has no api package.
-if [ -f /app/packages/api/.venv/bin/activate ]; then
-    source /app/packages/api/.venv/bin/activate
-    echo "[$(date +%H:%M:%S)] Python venv activated (/app/packages/api/.venv)"
-else
-    echo "ERROR: /app/packages/api/.venv not found. Run this script on the API AMI (PoC + API overlay), not the PoC-only AMI." >&2
-    exit 1
-fi
 
 # Create log directory for uvicorn if it doesn't exist
 UVICORN_LOG_DIR="${LOG_DIR:-/tmp/logs}"
 mkdir -p "$UVICORN_LOG_DIR"
 
-# Start uvicorn in background with logging to file and stdout
-# Using --log-level debug for application-level details
-# Access logs enabled to see all requests
-# Python application logs will appear in stderr/stdout
-echo "[$(date +%H:%M:%S)] Starting uvicorn with PID tracking and logging..."
-echo "Uvicorn command: PYTHONUNBUFFERED=1 uvicorn pow.service.app:app --host 0.0.0.0 --port 8080 --log-level debug --access-log"
+source /app/packages/api/.venv/bin/activate
+
+# Warm Linux page cache for model weights (parallel reads) before uvicorn/vLLM start
+if [ -x /data/compressa-tests/warm-page-cache.sh ]; then
+    echo "[$(date +%H:%M:%S)] Warming page cache for $HF_HOME (PARALLEL_READERS=16)..."
+    PARALLEL_READERS=16 /data/compressa-tests/warm-page-cache.sh || echo "WARNING: warm-page-cache.sh failed, continuing..." >&2
+fi
 
 # Start uvicorn and capture both stdout and stderr
 python -m uvicorn api.app:app --host 0.0.0.0 --port 8080 2>&1 | tee "$UVICORN_LOG_DIR/uvicorn.log" &
@@ -105,6 +110,12 @@ UVICORN_LAUNCH_TIME=$(date +%s)
 LAUNCH_DURATION=$((UVICORN_LAUNCH_TIME - UVICORN_START_TIME))
 echo "[$(date +%H:%M:%S)] Uvicorn process launched (PID: $UVICORN_PID, launch took ${LAUNCH_DURATION}s)"
 echo "Uvicorn logs: $UVICORN_LOG_DIR/uvicorn.log"
+
+# Start vLLM natively in background (PoC routes are in the overlay)
+# echo "Starting vLLM PoC server natively (port 8080)..."
+# /app/vllm-poc/.venv/bin/python -m vllm.entrypoints.openai.api_server $VLLM_ARGS &
+# VLLM_PID=$!
+# echo "vLLM started (PID $VLLM_PID). Waiting for /api/v1/state..."
 
 # Give uvicorn a moment to start the process
 sleep 1
@@ -206,6 +217,7 @@ else
         echo "WARNING: inference-up.py failed, but continuing..." >&2
     }
 fi
+echo "Inference engine is up!"
 
 # Register with MLNode API (so pow_v2_routes can discover this backend)
 REGISTRATION_JSON=${REGISTRATION_JSON:-}
@@ -218,7 +230,7 @@ if [ -z "$REGISTRATION_JSON" ]; then
    "max_concurrent": 500,
    "models": {
      "'$MODEL_NAME'": {
-       "args": ["--tensor-parallel-size","'$TENSOR_PARALLEL_SIZE'", "--quantization","fp8", "--kv-cache-dtype","fp8"]
+       "args": ["--tensor-parallel-size","'$TENSOR_PARALLEL_SIZE'", "--load-format","fastsafetensors", "--quantization","fp8"]
      }
    },
    "poc_hw": {
@@ -248,29 +260,25 @@ if [ -n "$GPU_DEVICES" ] && [ "$GPU_DEVICES" != "{}" ]; then
   done
 fi
 
-# POC init: get init_generate from API and POST to local /api/v1/pow/init/generate
-if [ "${POC_NODE}" = "true" ]; then
-  FIRST_API_NODE="${API_NODES_ARRAY[0]}"
-  echo "Requesting init_generate from API: ${FIRST_API_NODE}"
-  INIT_RESPONSE=$(curl -s --max-time 30 "http://${FIRST_API_NODE}/admin/v1/poc_init/${CLIENT_ID}?access=true" 2>/dev/null || echo "{}")
-  INIT_GENERATE_JSON=$(echo "$INIT_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(json.dumps(d.get('init_generate') or {}))" 2>/dev/null || echo "")
-  if [ -n "$INIT_GENERATE_JSON" ] && [ "$INIT_GENERATE_JSON" != "null" ] && [ "$INIT_GENERATE_JSON" != "{}" ]; then
-    echo "Posting init_generate to local /api/v1/pow/init/generate"
 
-    # Use inference endpoint for version v2, else pow endpoint
-    INIT_VERSION=$(echo "$INIT_GENERATE_JSON" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('version', ''))" 2>/dev/null || echo "")
-    if [ "$INIT_VERSION" = "v2" ]; then
-      POW_INIT_ENDPOINT="http://127.0.0.1:8080/api/v1/inference/pow/init/generate"
-    else
-      POW_INIT_ENDPOINT="http://127.0.0.1:8080/api/v1/pow/init/generate"
-    fi
-    echo "Using endpoint: $POW_INIT_ENDPOINT"
-
-    HTTP_CODE=$(curl -s -o /tmp/pow_init_response.json -w "%{http_code}" --max-time 30 -X POST "$POW_INIT_ENDPOINT" \
-      -H "Content-Type: application/json" -d "$INIT_GENERATE_JSON" 2>/dev/null || echo "000")
-    echo "Local pow/init/generate HTTP $HTTP_CODE"
-    rm -f /tmp/pow_init_response.json
+FIRST_API_NODE="${API_NODES_ARRAY[0]}"
+echo "Requesting init_generate from API: ${FIRST_API_NODE}"
+INIT_RESPONSE=$(curl -s --max-time 30 "http://${FIRST_API_NODE}/admin/v1/poc_init/${CLIENT_ID}?access=true" 2>/dev/null || echo "{}")
+INIT_GENERATE_JSON=$(echo "$INIT_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(json.dumps(d.get('init_generate') or {}))" 2>/dev/null || echo "")
+if [ -n "$INIT_GENERATE_JSON" ] && [ "$INIT_GENERATE_JSON" != "null" ] && [ "$INIT_GENERATE_JSON" != "{}" ]; then
+  # Use inference endpoint for version v2, else pow endpoint
+  INIT_VERSION=$(echo "$INIT_GENERATE_JSON" | python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('version', ''))" 2>/dev/null || echo "")
+  if [ "$INIT_VERSION" = "v2" ]; then
+    POW_INIT_ENDPOINT="http://127.0.0.1:8080/api/v1/inference/pow/init/generate"
+  else
+    POW_INIT_ENDPOINT="http://127.0.0.1:8080/api/v1/pow/init/generate"
   fi
+  echo "POW version: $INIT_VERSION"
+  echo "Posting init_generate to local $POW_INIT_ENDPOINT"
+  HTTP_CODE=$(curl -s -o /tmp/pow_init_response.json -w "%{http_code}" --max-time 30 -X POST "$POW_INIT_ENDPOINT" \
+    -H "Content-Type: application/json" -d "$INIT_GENERATE_JSON" 2>/dev/null || echo "000")
+  echo "Local pow/init/generate HTTP $HTTP_CODE"
+  rm -f /tmp/pow_init_response.json
 fi
 
 echo "vLLM PoC backend is running (native, no Docker). MLNode can proxy to this instance (e.g. poc_port 2${CLIENT_ID} via FRP)."

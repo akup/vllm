@@ -2,40 +2,28 @@
   "variables": {
     "aws_region": "us-east-1",
     "source_image": "",
-    "instance_type": "r6i.4xlarge",
-    "ami_name": "project-vllm-base-ami-{{timestamp}}",
-    "ami_description": "Base AMI with vLLM installed (native, no Docker). No start.sh or PoC overlay; use packer-poc.json to build PoC image.",
-    "python_version": "3.11",
-    "vllm_build_cache_bucket": "",
-    "vllm_build_cache_prefix": "vllm-wheels",
-    "vllm_build_cache_version": "",
-    "vllm_build_overlay_files": "",
-    "vllm_build_version": "0.9.1",
-    "vllm_build_verbose": "1",
-    "iam_instance_profile": ""
+    "instance_type": "g5.xlarge",
+    "ami_name": "project-vllm-modified-ami-{{timestamp}}",
+    "ami_description": "Self-contained AMI with vLLM + PoC backend (native install, no Docker), for MLNode pow_v2 backends",
+    "python_version": "3.11"
   },
   "builders": [
     {
       "type": "amazon-ebs",
       "region": "{{user `aws_region`}}",
-      "iam_instance_profile": "{{user `iam_instance_profile`}}",
       "source_ami_filter": {
         "filters": {
           "virtualization-type": "hvm",
-          "name": "project-vllm-prereq-ami-*",
-          "root-device-type": "ebs",
-          "state": "available"
+          "name": "Deep Learning OSS Nvidia Driver AMI GPU PyTorch 2.9 (Amazon Linux 2023)*",
+          "root-device-type": "ebs"
         },
-        "owners": ["self"],
+        "owners": ["amazon"],
         "most_recent": true
       },
       "source_ami": "{{user `source_image`}}",
       "instance_type": "{{user `instance_type`}}",
       "ssh_username": "ec2-user",
       "ssh_pty": true,
-      "ssh_keep_alive_interval": "15s",
-      "ssh_read_write_timeout": "60m",
-      "ssh_timeout": "15m",
       "ami_name": "{{user `ami_name`}}",
       "ami_description": "{{user `ami_description`}}",
       "launch_block_device_mappings": [
@@ -48,8 +36,8 @@
       ],
       "tags": {
         "Name": "{{user `ami_name`}}",
-        "Source": "vLLM base (no PoC overlay)",
-        "Project": "project-vllm-base"
+        "Source": "vLLM native + PoC overlay",
+        "Project": "project-vllm-modified"
       },
       "ami_regions": ["{{user `aws_region`}}"],
       "skip_region_validation": false,
@@ -60,7 +48,80 @@
     {
       "type": "shell",
       "inline": [
-        "echo 'Preparing vLLM source directory (base image is project-vllm-prereq-ami; CUDA and PyTorch already installed)...'",
+        "echo 'Updating system packages...'",
+        "sudo dnf update -y",
+        "sudo dnf clean all",
+        "echo 'System update completed'"
+      ]
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "echo 'Installing CUDA 12.x toolkit for vLLM build (vLLM expects CUDA 12, not 13)...'",
+        "sudo dnf install -y dnf-plugins-core",
+        "sudo dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo || true",
+        "sudo dnf clean all",
+        "sudo dnf install -y cuda-toolkit-12-1 || sudo dnf install -y cuda-12-1 || true",
+        "sudo dnf install -y cuda-nvtx-12-1 cuda-nvtx-devel-12-1 || sudo dnf install -y cuda-nvtx cuda-nvtx-devel || true",
+        "VLLM_CUDA_DIR=''",
+        "for d in /usr/local/cuda-12.1 /usr/local/cuda-12.2 /usr/local/cuda-12.4 /usr/local/cuda-12; do [ -x \"$d/bin/nvcc\" ] 2>/dev/null && VLLM_CUDA_DIR=$d && break; done",
+        "[ -z \"$VLLM_CUDA_DIR\" ] && for d in /usr/local/cuda-12*; do [ -x \"$d/bin/nvcc\" ] 2>/dev/null && VLLM_CUDA_DIR=$d && break; done",
+        "[ -n \"$VLLM_CUDA_DIR\" ] && echo \"Using CUDA for vLLM build: $VLLM_CUDA_DIR\" && $VLLM_CUDA_DIR/bin/nvcc --version || echo 'WARNING: CUDA 12.x not found; build may use system CUDA'"
+      ],
+      "timeout": "45m"
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "echo 'Verifying NVIDIA drivers (pre-installed in DLAMI)...'",
+        "if command -v nvidia-smi &> /dev/null; then",
+        "  echo 'NVIDIA drivers present (from DLAMI)'",
+        "  nvidia-smi --list-gpus 2>/dev/null || echo 'No GPUs on build instance (expected)'",
+        "else",
+        "  echo 'WARNING: NVIDIA drivers not found'",
+        "fi"
+      ]
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "echo 'Installing Python {{user `python_version`}} and build deps...'",
+        "sudo dnf install -y python{{user `python_version`}} python{{user `python_version`}}-devel python{{user `python_version`}}-pip",
+        "sudo dnf install -y gcc gcc-c++ make git wget jq",
+        "python{{user `python_version`}} --version"
+      ]
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "echo 'Installing FRP client...'",
+        "FRP_VERSION=0.65.0",
+        "mkdir -p /tmp/frp && cd /tmp/frp",
+        "wget -qO- \"https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/frp_${FRP_VERSION}_linux_amd64.tar.gz\" | tar -xzf -",
+        "sudo install -m 0755 \"frp_${FRP_VERSION}_linux_amd64/frpc\" /usr/bin/frpc",
+        "rm -rf /tmp/frp",
+        "frpc -v"
+      ]
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "echo 'Creating app directory and venv...'",
+        "sudo mkdir -p /app/vllm-poc",
+        "sudo chown -R ec2-user:ec2-user /app",
+        "mkdir -p /var/tmp/pip-build",
+        "chmod 1777 /var/tmp/pip-build",
+        "cd /app/vllm-poc",
+        "python{{user `python_version`}} -m venv .venv",
+        "source .venv/bin/activate",
+        "pip install --upgrade pip",
+        "echo 'Venv created'"
+      ]
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "echo 'Preparing vLLM source directory...'",
         "mkdir -p /tmp/vllm-src"
       ]
     },
@@ -110,77 +171,64 @@
       "destination": "/tmp/vllm-src/cmake"
     },
     {
-      "type": "file",
-      "source": "ami/scripts/vllm-build-with-cache.sh",
-      "destination": "/tmp/vllm-build-with-cache.sh"
-    },
-    {
       "type": "shell",
       "inline": [
-        "echo 'Installing AWS CLI (for S3 cache when vllm_build_cache_bucket is set)...'",
-        "sudo dnf install -y aws-cli || true",
-        "aws --version 2>/dev/null || echo 'aws-cli not installed; S3 cache will be skipped'"
+        "echo 'Installing PyTorch and build dependencies (required before pip install)...'",
+        "cd /app/vllm-poc",
+        "source .venv/bin/activate",
+        "export TMPDIR=/var/tmp/pip-build",
+        "export TMP=/var/tmp/pip-build",
+        "export PIP_DEFAULT_TIMEOUT=300",
+        "export PIP_TIMEOUT=300",
+        "pip install numpy",
+        "pip install torch --index-url https://download.pytorch.org/whl/cu121 || pip install torch",
+        "pip install -r /tmp/vllm-src/requirements/build.txt",
+        "echo 'Build dependencies installed'"
       ]
     },
     {
       "type": "shell",
       "inline": [
-        "export VLLM_BUILD_CACHE_BUCKET='{{user `vllm_build_cache_bucket`}}'",
-        "export VLLM_BUILD_CACHE_PREFIX='{{user `vllm_build_cache_prefix`}}'",
-        "if [ -n \"$VLLM_BUILD_CACHE_BUCKET\" ]; then echo 'vLLM build cache: ENABLED (bucket='$VLLM_BUILD_CACHE_BUCKET' prefix='${VLLM_BUILD_CACHE_PREFIX:-vllm-wheels}')'; else echo 'vLLM build cache: DISABLED (vllm_build_cache_bucket not set)'; fi",
-        "echo 'Installing vLLM (from S3 cache if bucket set, else build; with cache: intermediate state uploaded every 10 min)...'",
-        "export VLLM_BUILD_VERSION='{{user `vllm_build_version`}}'",
-        "export VLLM_BUILD_CACHE_VERSION='{{user `vllm_build_cache_version`}}'",
-        "export VLLM_BUILD_OVERLAY_FILES='{{user `vllm_build_overlay_files`}}'",
-        "export VLLM_BUILD_VERBOSE='{{user `vllm_build_verbose`}}'",
-        "export PYVER='{{user `python_version`}}'",
+        "echo 'Installing vLLM from local repo (verbose build; can take 1–2 hours)...'",
         "export CUDA_HOME=''",
-        "for d in /usr/local/cuda-12.8 /usr/local/cuda-12; do [ -x \"$d/bin/nvcc\" ] 2>/dev/null && export CUDA_HOME=$d && break; done",
+        "for d in /usr/local/cuda-12.1 /usr/local/cuda-12.2 /usr/local/cuda-12.4 /usr/local/cuda-12; do [ -x \"$d/bin/nvcc\" ] 2>/dev/null && export CUDA_HOME=$d && break; done",
         "[ -z \"$CUDA_HOME\" ] && for d in /usr/local/cuda-12*; do [ -x \"$d/bin/nvcc\" ] 2>/dev/null && export CUDA_HOME=$d && break; done",
         "[ -z \"$CUDA_HOME\" ] && export CUDA_HOME=/usr/local/cuda",
-        "[ -z \"$CUDA_HOME\" ] || [ ! -x \"$CUDA_HOME/bin/nvcc\" ] && { echo 'ERROR: No CUDA toolkit found; PyTorch cu128 requires CUDA 12.8.'; exit 1; }",
+        "echo \"Building vLLM with CUDA_HOME=$CUDA_HOME\"",
         "export PATH=$CUDA_HOME/bin:$PATH",
         "export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}",
         "export TMPDIR=/var/tmp/pip-build",
         "export TMP=/var/tmp/pip-build",
         "export PIP_DEFAULT_TIMEOUT=300",
         "export PIP_TIMEOUT=300",
-        "export MAX_JOBS=2",
-        "export NVCC_THREADS=1",
-        "export CMAKE_BUILD_PARALLEL_LEVEL=2",
+        "export PIP_NO_BUILD_ISOLATION=1",
+        "export SETUPTOOLS_SCM_PRETEND_VERSION=0.9.1",
         "cd /app/vllm-poc",
         "source .venv/bin/activate",
-        "if [ -n \"$VLLM_BUILD_CACHE_BUCKET\" ]; then",
-        "  chmod +x /tmp/vllm-build-with-cache.sh",
-        "  /tmp/vllm-build-with-cache.sh",
-        "else",
-        "  MAX_RETRIES=10",
-        "  RETRY_COUNT=0",
-        "  while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do",
-        "    PIP_VERBOSE_FLAG=''; [ \"$VLLM_BUILD_VERBOSE\" = '2' ] && PIP_VERBOSE_FLAG='-v'",
-        "    cd /tmp/vllm-src",
-        "    set -o pipefail",
-        "    TMPDIR=/var/tmp/pip-build TMP=/var/tmp/pip-build SETUPTOOLS_SCM_PRETEND_VERSION=0.9.1 MAX_JOBS=2 NVCC_THREADS=1 CMAKE_BUILD_PARALLEL_LEVEL=2 VERBOSE=$VLLM_BUILD_VERBOSE pip install $PIP_VERBOSE_FLAG --no-build-isolation . 2>&1 | tee /tmp/vllm-install.log | grep -v \"Skipping link\" || true",
-        "    if [ ${PIPESTATUS[0]} -eq 0 ]; then",
-        "      echo 'vLLM installation from local repo succeeded'",
-        "      break",
+        "MAX_RETRIES=3",
+        "RETRY_COUNT=0",
+        "while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do",
+        "  cd /tmp/vllm-src",
+        "  set -o pipefail",
+        "  if TMPDIR=/var/tmp/pip-build TMP=/var/tmp/pip-build SETUPTOOLS_SCM_PRETEND_VERSION=0.9.1 pip install -vv --no-build-isolation . 2>&1 | tee /tmp/vllm-install.log; then",
+        "    echo 'vLLM installation from local repo succeeded'",
+        "    break",
+        "  else",
+        "    RETRY_COUNT=$((RETRY_COUNT + 1))",
+        "    echo 'Last 80 lines of /tmp/vllm-install.log:'",
+        "    tail -80 /tmp/vllm-install.log",
+        "    if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then",
+        "      echo 'Retrying vLLM install in 15s...'",
+        "      sleep 15",
         "    else",
-        "      RETRY_COUNT=$((RETRY_COUNT + 1))",
-        "      echo 'Last 80 lines of /tmp/vllm-install.log:'",
-        "      tail -80 /tmp/vllm-install.log",
-        "      if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then",
-        "        echo \"Retry $RETRY_COUNT/$MAX_RETRIES: re-running build without cleaning (Ninja will resume)...\"",
-        "        sleep 10",
-        "      else",
-        "        echo 'ERROR: vLLM installation from local repo failed after retries'",
-        "        exit 1",
-        "      fi",
+        "      echo 'ERROR: vLLM installation from local repo failed'",
+        "      exit 1",
         "    fi",
-        "  done",
-        "fi",
+        "  fi",
+        "done",
         "rm -rf /tmp/vllm-src"
       ],
-      "timeout": "300m"
+      "timeout": "180m"
     },
     {
       "type": "shell",
@@ -191,77 +239,67 @@
         "export VLLM_USE_V1=0",
         "python -c \"import vllm; print('vllm:', vllm.__file__)\"",
         "python -c \"import vllm.poc.routes; print('vllm.poc.routes OK')\"",
-        "python -m vllm.entrypoints.openai.api_server --device cpu --help | head -5",
+        "python -m vllm.entrypoints.openai.api_server --help | head -5",
         "echo 'Verification OK'"
+      ]
+    },
+    {
+      "type": "file",
+      "source": "ami/start.sh",
+      "destination": "/var/tmp/vllm-poc-start.sh"
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "echo 'Setting up start script and env...'",
+        "sudo mv /var/tmp/vllm-poc-start.sh /usr/local/bin/start-vllm-poc.sh",
+        "sudo chmod +x /usr/local/bin/start-vllm-poc.sh",
+        "sudo tee /etc/profile.d/gonka-vllm-poc.sh > /dev/null <<'EOF'",
+        "# Gonka vLLM PoC Environment (native, no Docker)",
+        "export VLLM_USE_V1=0",
+        "export HF_HOME=${HF_HOME:-/home/ec2-user/.cache/huggingface}",
+        "export PATH=\"/app/vllm-poc/.venv/bin:$PATH\"",
+        "EOF",
+        "sudo chmod 644 /etc/profile.d/gonka-vllm-poc.sh",
+        "echo 'Start script: /usr/local/bin/start-vllm-poc.sh'"
       ]
     },
     {
       "type": "shell",
       "inline": [
-        "echo 'Installing CloudWatch agent...'",
-        "if command -v wget >/dev/null 2>&1; then",
-        "  DOWNLOAD_CMD='wget'",
-        "elif command -v curl >/dev/null 2>&1; then",
-        "  DOWNLOAD_CMD='curl -L -o'",
-        "else",
-        "  echo 'ERROR: Neither wget nor curl available'",
-        "  exit 1",
-        "fi",
-        "if [ \"$DOWNLOAD_CMD\" = \"wget\" ]; then",
-        "  $DOWNLOAD_CMD https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm -O /tmp/amazon-cloudwatch-agent.rpm",
-        "else",
-        "  $DOWNLOAD_CMD /tmp/amazon-cloudwatch-agent.rpm https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm",
-        "fi",
-        "if [ -f /tmp/amazon-cloudwatch-agent.rpm ]; then",
-        "  if sudo rpm -U /tmp/amazon-cloudwatch-agent.rpm; then",
-        "    echo 'CloudWatch agent installed successfully'",
-        "    rm -f /tmp/amazon-cloudwatch-agent.rpm",
-        "  else",
-        "    echo 'ERROR: Failed to install CloudWatch agent RPM'",
-        "    exit 1",
-        "  fi",
-        "else",
-        "  echo 'ERROR: Failed to download CloudWatch agent RPM'",
-        "  exit 1",
-        "fi",
-        "echo 'CloudWatch agent installation completed'"
+        "echo 'Creating systemd service for vLLM PoC...'",
+        "sudo tee /etc/systemd/system/vllm-poc.service > /dev/null <<'EOF'",
+        "[Unit]",
+        "Description=vLLM PoC Backend (native)",
+        "After=network.target",
+        "",
+        "[Service]",
+        "Type=simple",
+        "User=ec2-user",
+        "WorkingDirectory=/app/vllm-poc",
+        "Environment=\"PATH=/app/vllm-poc/.venv/bin:/usr/local/bin:/usr/bin:/bin\"",
+        "EnvironmentFile=-/etc/profile.d/gonka-vllm-poc.sh",
+        "EnvironmentFile=-/etc/gonka-container.env",
+        "ExecStart=/usr/local/bin/start-vllm-poc.sh",
+        "Restart=on-failure",
+        "RestartSec=10",
+        "StandardOutput=journal",
+        "StandardError=journal",
+        "",
+        "[Install]",
+        "WantedBy=multi-user.target",
+        "EOF",
+        "sudo systemctl daemon-reload",
+        "echo 'Service: vllm-poc.service'"
       ]
-    },
-    {
-      "type": "file",
-      "source": "ami/setup-cloudwatch-agent.sh",
-      "destination": "/var/tmp/setup-cloudwatch-agent.sh"
-    },
-    {
-      "type": "file",
-      "source": "ami/cloudwatch-agent.service",
-      "destination": "/var/tmp/cloudwatch-agent.service"
-    },
-    {
-      "type": "file",
-      "source": "ami/cloudwatch-config.json",
-      "destination": "/var/tmp/amazon-cloudwatch-agent.json.template"
     },
     {
       "type": "shell",
       "inline": [
         "echo 'AMI build completed successfully!'",
-        "echo 'Base vLLM at /app/vllm-poc/.venv (no start.sh; build PoC image with packer-poc.json)'"
-      ]
-    },
-    {
-      "type": "shell",
-      "inline": [
-        "echo 'Configuring CloudWatch agent for early startup...'",
-        "sudo mv /var/tmp/setup-cloudwatch-agent.sh /usr/local/bin/setup-cloudwatch-agent.sh",
-        "sudo chmod +x /usr/local/bin/setup-cloudwatch-agent.sh",
-        "sudo mv /var/tmp/cloudwatch-agent.service /etc/systemd/system/cloudwatch-agent.service",
-        "sudo mkdir -p /opt/aws/amazon-cloudwatch-agent/etc",
-        "sudo mv /var/tmp/amazon-cloudwatch-agent.json.template /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json.template",
-        "sudo chmod 644 /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json.template",
-        "sudo systemctl daemon-reload",
-        "sudo systemctl enable cloudwatch-agent.service",
-        "echo 'CloudWatch agent configured to start after cloud-init'"
+        "echo 'Native vLLM + PoC at /app/vllm-poc/.venv (no Docker)'",
+        "echo 'Start: /usr/local/bin/start-vllm-poc.sh'",
+        "echo 'API: /api/v1/state, /api/v1/pow/init/generate, /api/v1/pow/generate, /api/v1/pow/status, /api/v1/pow/stop'"
       ]
     }
   ]

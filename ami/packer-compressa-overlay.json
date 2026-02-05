@@ -1,0 +1,49 @@
+{
+  "variables": {
+    "aws_region": "us-east-1",
+    "source_ami_id": "ami-00b3bf19b0cd859db",
+    "instance_type": "r6i.2xlarge",
+    "ami_name": "project-vllm-api-compressa-{{timestamp}}",
+    "ami_description": "Overlay: fresh compressa-tests scripts only. Source AMI: {{user `source_ami_id`}}."
+  },
+  "builders": [
+    {
+      "type": "amazon-ebs",
+      "region": "{{user `aws_region`}}",
+      "source_ami": "{{user `source_ami_id`}}",
+      "instance_type": "{{user `instance_type`}}",
+      "ssh_username": "ec2-user",
+      "ssh_pty": true,
+      "ami_name": "{{user `ami_name`}}",
+      "ami_description": "{{user `ami_description`}}",
+      "tags": {
+        "Name": "{{user `ami_name`}}",
+        "Source": "compressa-tests overlay",
+        "Project": "project-vllm-api"
+      },
+      "ami_regions": ["{{user `aws_region`}}"],
+      "skip_region_validation": false,
+      "skip_save_build_region": false
+    }
+  ],
+  "provisioners": [
+    {
+      "type": "file",
+      "source": "ami/scripts/compressa-tests",
+      "destination": "/tmp/compressa-tests"
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "echo 'Copying fresh compressa-tests to /data/...'",
+        "sudo mkdir -p /data /data/vllm-cache /data/huggingface",
+        "sudo rm -rf /data/compressa-tests",
+        "sudo cp -r /tmp/compressa-tests /data/",
+        "sudo chown -R ec2-user:ec2-user /data/compressa-tests /data/vllm-cache /data/huggingface",
+        "chmod +x /data/compressa-tests/warmup-vllm-cache.sh /data/compressa-tests/warm-model-page-cache.sh /data/compressa-tests/warm-page-cache.sh /data/compressa-tests/prepare-vllm-cache-build.sh /data/compressa-tests/download-vllm-cache-from-s3.sh /data/compressa-tests/upload-vllm-cache-to-s3.sh 2>/dev/null || true",
+        "rm -rf /tmp/compressa-tests",
+        "echo 'Done: /data/compressa-tests updated from repo'"
+      ]
+    }
+  ]
+}

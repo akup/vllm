@@ -1,7 +1,7 @@
 {
   "variables": {
     "aws_region": "us-east-1",
-    "poc_ami_id": "ami-05cc311590b8034a8",
+    "poc_ami_id": "ami-0c2141df05cb46c85",
     "instance_type": "r6i.2xlarge",
     "ami_name": "project-vllm-api-ami-{{timestamp}}",
     "ami_description": "vLLM API overlay AMI: PoC AMI + MLNode API (uvicorn). Source: project-vllm-poc-ami."
@@ -19,8 +19,9 @@
       "launch_block_device_mappings": [
         {
           "device_name": "/dev/xvda",
-          "volume_size": 500,
-          "volume_type": "gp3",
+          "volume_size": 350,
+          "volume_type": "io2",
+          "iops": 64000,
           "delete_on_termination": true
         }
       ],
@@ -103,6 +104,8 @@
         "export PYTHONPATH=\"${PYTHONPATH:-/app:/app/packages/api/src}\"",
         "# Runner starts vLLM as subprocess; use vLLM venv Python (runner.py uses VLLM_PYTHON_PATH)",
         "export VLLM_PYTHON_PATH=\"/app/vllm-poc/.venv/bin/python\"",
+        "# vLLM compile + P2P cache (prepare at build with prepare-vllm-cache-build.sh)",
+        "export VLLM_CACHE_ROOT=\"${VLLM_CACHE_ROOT:-/data/vllm-cache}\"",
         "EOF",
         "sudo chmod 644 /etc/profile.d/gonka-api.sh",
         "echo 'Env: /etc/profile.d/gonka-api.sh'"
@@ -117,11 +120,34 @@
       "type": "shell",
       "inline": [
         "echo 'Copying compressa-tests to /data/...'",
-        "sudo mkdir -p /data",
+        "sudo mkdir -p /data /data/vllm-cache /data/huggingface",
         "sudo cp -r /tmp/compressa-tests /data/",
-        "sudo chown -R ec2-user:ec2-user /data/compressa-tests",
+        "sudo chown -R ec2-user:ec2-user /data/compressa-tests /data/vllm-cache /data/huggingface",
+        "chmod +x /data/compressa-tests/warmup-vllm-cache.sh /data/compressa-tests/warm-model-page-cache.sh /data/compressa-tests/warm-page-cache.sh /data/compressa-tests/prepare-vllm-cache-build.sh /data/compressa-tests/download-vllm-cache-from-s3.sh /data/compressa-tests/upload-vllm-cache-to-s3.sh 2>/dev/null || true",
         "rm -rf /tmp/compressa-tests",
-        "echo 'compressa-tests at /data/compressa-tests'"
+        "echo 'compressa-tests at /data/compressa-tests; VLLM_CACHE_ROOT=/data/vllm-cache'"
+      ]
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "echo 'Installing fastsafetensors for --load-format fastsafetensors...'",
+        "cd /app/vllm-poc",
+        "source .venv/bin/activate",
+        "pip install 'fastsafetensors>=0.1.10'",
+        "python -c \"import fastsafetensors; print('fastsafetensors OK')\"",
+        "echo 'fastsafetensors installed'"
+      ]
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "echo 'Installing fastsafetensors (to /app/packages/api) for --load-format fastsafetensors...'",
+        "cd /app/packages/api",
+        "source .venv/bin/activate",
+        "pip install 'fastsafetensors>=0.1.10'",
+        "python -c \"import fastsafetensors; print('fastsafetensors OK')\"",
+        "echo 'fastsafetensors installed'"
       ]
     },
     {
