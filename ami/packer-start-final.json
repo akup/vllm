@@ -1,0 +1,56 @@
+{
+  "variables": {
+    "aws_region": "us-east-1",
+    "source_ami_id": "ami-0936c0e7371d4939c",
+    "instance_type": "r6i.2xlarge",
+    "ami_name": "project-vllm-api-start-{{timestamp}}",
+    "ami_description": "Final overlay: start.sh in /usr/local/bin for USER_DATA. Source: {{user `source_ami_id`}}."
+  },
+  "builders": [
+    {
+      "type": "amazon-ebs",
+      "region": "{{user `aws_region`}}",
+      "source_ami": "{{user `source_ami_id`}}",
+      "instance_type": "{{user `instance_type`}}",
+      "ssh_username": "ec2-user",
+      "ssh_pty": true,
+      "ami_name": "{{user `ami_name`}}",
+      "ami_description": "{{user `ami_description`}}",
+      "tags": {
+        "Name": "{{user `ami_name`}}",
+        "Source": "start.sh final overlay",
+        "Project": "project-vllm-api"
+      },
+      "ami_regions": ["{{user `aws_region`}}"],
+      "skip_region_validation": false,
+      "skip_save_build_region": false
+    }
+  ],
+  "provisioners": [
+    {
+      "type": "file",
+      "source": "ami/start.sh",
+      "destination": "/tmp/start.sh"
+    },
+    {
+      "type": "file",
+      "source": "ami/scripts/compressa-tests/warm-page-cache.py",
+      "destination": "/tmp/warm-page-cache.py"
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "echo 'Installing start.sh to /usr/local/bin...'",
+        "sudo cp /tmp/start.sh /usr/local/bin/start.sh",
+        "sudo chmod +x /usr/local/bin/start.sh",
+        "rm -f /tmp/start.sh",
+        "echo 'Installing warm-page-cache.py to /data/compressa-tests...'",
+        "sudo mkdir -p /data/compressa-tests",
+        "sudo cp /tmp/warm-page-cache.py /data/compressa-tests/warm-page-cache.py",
+        "sudo chmod +x /data/compressa-tests/warm-page-cache.py",
+        "rm -f /tmp/warm-page-cache.py",
+        "echo 'Done: /usr/local/bin/start.sh, /data/compressa-tests/warm-page-cache.py (call from USER_DATA on startup)'"
+      ]
+    }
+  ]
+}

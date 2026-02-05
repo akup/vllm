@@ -40,7 +40,7 @@
         "sudo rm -rf /data/compressa-tests",
         "sudo cp -r /tmp/compressa-tests /data/",
         "sudo chown -R ec2-user:ec2-user /data/compressa-tests /data/vllm-cache /data/huggingface",
-        "chmod +x /data/compressa-tests/warmup-vllm-cache.sh /data/compressa-tests/warm-model-page-cache.sh /data/compressa-tests/warm-page-cache.sh /data/compressa-tests/prepare-vllm-cache-build.sh /data/compressa-tests/download-vllm-cache-from-s3.sh /data/compressa-tests/upload-vllm-cache-to-s3.sh 2>/dev/null || true",
+        "chmod +x /data/compressa-tests/warmup-vllm-cache.sh /data/compressa-tests/warm-model-page-cache.sh /data/compressa-tests/warm-page-cache.sh /data/compressa-tests/prepare-vllm-cache-build.sh /data/compressa-tests/download-vllm-cache-from-s3.sh /data/compressa-tests/upload-vllm-cache-to-s3.sh /data/compressa-tests/check-instance-ebs-iops.sh /data/compressa-tests/disk-read-diagnostics.sh 2>/dev/null || true",
         "rm -rf /tmp/compressa-tests",
         "echo 'Done: /data/compressa-tests updated from repo'"
       ]

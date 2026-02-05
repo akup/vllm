@@ -97,10 +97,13 @@ mkdir -p "$UVICORN_LOG_DIR"
 
 source /app/packages/api/.venv/bin/activate
 
-# Warm Linux page cache for model weights (parallel reads) before uvicorn/vLLM start
+echo "Activated and want to read huggingface"
+
+# Warm Linux page cache for model weights in background (so uvicorn starts immediately and logs are not blocked)
+# PYTHONUNBUFFERED=1 so progress lines appear in the log immediately
 if [ -x /data/compressa-tests/warm-page-cache.sh ]; then
-    echo "[$(date +%H:%M:%S)] Warming page cache for $HF_HOME (PARALLEL_READERS=16)..."
-    PARALLEL_READERS=16 /data/compressa-tests/warm-page-cache.sh || echo "WARNING: warm-page-cache.sh failed, continuing..." >&2
+    echo "[$(date +%H:%M:%S)] Starting page-cache warm in background (PARALLEL_READERS=16); log: $UVICORN_LOG_DIR/warm-page-cache.log"
+    PARALLEL_READERS=16 PYTHONUNBUFFERED=1 /data/compressa-tests/warm-page-cache.sh >> "${UVICORN_LOG_DIR}/warm-page-cache.log" 2>&1 &
 fi
 
 # Start uvicorn and capture both stdout and stderr

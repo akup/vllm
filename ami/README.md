@@ -123,6 +123,23 @@ aws ec2 create-image \
 
 Use `--no-reboot` to avoid rebooting the instance (crash-consistent snapshot). Omit it for a reboot and more consistent state. Check AMI status with `aws ec2 describe-images --image-ids <ImageId>` until `State` is `available`. New instances launched from this AMI will have the warmed cache and start faster.
 
+## Final overlay: start.sh for USER_DATA (packer-start-final.json)
+
+To have **start.sh** installed at **`/usr/local/bin/start.sh`** (executable) so your **USER_DATA** script can call it on instance startup, build the final overlay from your API or compressa overlay AMI:
+
+```bash
+cd /path/to/vllm
+packer build -var "source_ami_id=ami-XXXXXXXX" ami/packer-start-final.json
+```
+
+Replace `ami-XXXXXXXX` with the API AMI id (or the compressa overlay AMI). Default `source_ami_id` is `ami-00b3bf19b0cd859db` if omitted.
+
+The resulting AMI is identical to the source except `ami/start.sh` is copied to `/usr/local/bin/start.sh` and made executable. In your launch template or USER_DATA, run:
+
+```bash
+/usr/local/bin/start.sh
+```
+
 ## Start on instance
 
 Set environment (e.g. in `/etc/gonka-container.env` or user-data), then:
