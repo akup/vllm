@@ -5,12 +5,20 @@
     "instance_type": "g5.xlarge",
     "ami_name": "project-vllm-modified-ami-{{timestamp}}",
     "ami_description": "Self-contained AMI with vLLM + PoC backend (native install, no Docker), for MLNode pow_v2 backends",
-    "python_version": "3.11"
+    "python_version": "3.11",
+    "vllm_build_cache_bucket": "",
+    "vllm_build_cache_prefix": "vllm-wheels",
+    "vllm_build_cache_version": "",
+    "vllm_build_overlay_files": "",
+    "vllm_build_version": "0.9.1",
+    "vllm_build_verbose": "1",
+    "iam_instance_profile": ""
   },
   "builders": [
     {
       "type": "amazon-ebs",
       "region": "{{user `aws_region`}}",
+      "iam_instance_profile": "{{user `iam_instance_profile`}}",
       "source_ami_filter": {
         "filters": {
           "virtualization-type": "hvm",
@@ -171,6 +179,19 @@
       "destination": "/tmp/vllm-src/cmake"
     },
     {
+      "type": "file",
+      "source": "ami/scripts/vllm-build-with-cache.sh",
+      "destination": "/tmp/vllm-build-with-cache.sh"
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "echo 'Installing AWS CLI (for S3 cache when vllm_build_cache_bucket is set)...'",
+        "sudo dnf install -y aws-cli || true",
+        "aws --version 2>/dev/null || echo 'aws-cli not installed; S3 cache will be skipped'"
+      ]
+    },
+    {
       "type": "shell",
       "inline": [
         "echo 'Installing PyTorch and build dependencies (required before pip install)...'",
@@ -189,7 +210,15 @@
     {
       "type": "shell",
       "inline": [
-        "echo 'Installing vLLM from local repo (verbose build; can take 1–2 hours)...'",
+        "export VLLM_BUILD_CACHE_BUCKET='{{user `vllm_build_cache_bucket`}}'",
+        "export VLLM_BUILD_CACHE_PREFIX='{{user `vllm_build_cache_prefix`}}'",
+        "export VLLM_BUILD_CACHE_VERSION='{{user `vllm_build_cache_version`}}'",
+        "export VLLM_BUILD_OVERLAY_FILES='{{user `vllm_build_overlay_files`}}'",
+        "export VLLM_BUILD_VERSION='{{user `vllm_build_version`}}'",
+        "export VLLM_BUILD_VERBOSE='{{user `vllm_build_verbose`}}'",
+        "export PYVER='{{user `python_version`}}'",
+        "if [ -n \"$VLLM_BUILD_CACHE_BUCKET\" ]; then echo 'vLLM build cache: ENABLED (bucket='$VLLM_BUILD_CACHE_BUCKET' prefix='${VLLM_BUILD_CACHE_PREFIX:-vllm-wheels}')'; else echo 'vLLM build cache: DISABLED (vllm_build_cache_bucket not set)'; fi",
+        "echo 'Installing vLLM (from S3 cache if bucket set, else full build; with cache: intermediate state uploaded every 10 min)...'",
         "export CUDA_HOME=''",
         "for d in /usr/local/cuda-12.1 /usr/local/cuda-12.2 /usr/local/cuda-12.4 /usr/local/cuda-12; do [ -x \"$d/bin/nvcc\" ] 2>/dev/null && export CUDA_HOME=$d && break; done",
         "[ -z \"$CUDA_HOME\" ] && for d in /usr/local/cuda-12*; do [ -x \"$d/bin/nvcc\" ] 2>/dev/null && export CUDA_HOME=$d && break; done",
@@ -199,34 +228,10 @@
         "export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}",
         "export TMPDIR=/var/tmp/pip-build",
         "export TMP=/var/tmp/pip-build",
-        "export PIP_DEFAULT_TIMEOUT=300",
-        "export PIP_TIMEOUT=300",
-        "export PIP_NO_BUILD_ISOLATION=1",
-        "export SETUPTOOLS_SCM_PRETEND_VERSION=0.9.1",
         "cd /app/vllm-poc",
         "source .venv/bin/activate",
-        "MAX_RETRIES=3",
-        "RETRY_COUNT=0",
-        "while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do",
-        "  cd /tmp/vllm-src",
-        "  set -o pipefail",
-        "  if TMPDIR=/var/tmp/pip-build TMP=/var/tmp/pip-build SETUPTOOLS_SCM_PRETEND_VERSION=0.9.1 pip install -vv --no-build-isolation . 2>&1 | tee /tmp/vllm-install.log; then",
-        "    echo 'vLLM installation from local repo succeeded'",
-        "    break",
-        "  else",
-        "    RETRY_COUNT=$((RETRY_COUNT + 1))",
-        "    echo 'Last 80 lines of /tmp/vllm-install.log:'",
-        "    tail -80 /tmp/vllm-install.log",
-        "    if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then",
-        "      echo 'Retrying vLLM install in 15s...'",
-        "      sleep 15",
-        "    else",
-        "      echo 'ERROR: vLLM installation from local repo failed'",
-        "      exit 1",
-        "    fi",
-        "  fi",
-        "done",
-        "rm -rf /tmp/vllm-src"
+        "bash /tmp/vllm-build-with-cache.sh",
+        "rm -rf /tmp/vllm-src /tmp/vllm-build-with-cache.sh"
       ],
       "timeout": "180m"
     },
