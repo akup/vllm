@@ -128,6 +128,9 @@ class VLLMRunner(IVLLMRunner):
 
             env = os.environ.copy()
             env["VLLM_USE_V1"] = "0"
+            # Flush vLLM (and engine subprocess) logs immediately; otherwise
+            # output is block-buffered when not a TTY and logs appear after long delays.
+            env.setdefault("PYTHONUNBUFFERED", "1")
 
             start_gpu = i * gpus_per_instance
             if total_gpus > 0:

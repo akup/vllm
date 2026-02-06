@@ -1,7 +1,7 @@
 {
   "variables": {
     "aws_region": "us-east-1",
-    "poc_ami_id": "ami-0c2141df05cb46c85",
+    "poc_ami_id": "ami-0c530e10cc0f6e28f",
     "instance_type": "r6i.2xlarge",
     "ami_name": "project-vllm-api-ami-{{timestamp}}",
     "ami_description": "vLLM API overlay AMI: PoC AMI + MLNode API (uvicorn). Source: project-vllm-poc-ami."
@@ -19,9 +19,10 @@
       "launch_block_device_mappings": [
         {
           "device_name": "/dev/xvda",
-          "volume_size": 350,
-          "volume_type": "io2",
-          "iops": 64000,
+          "volume_size": 100,
+          "volume_type": "gp3",
+          "throughput": 1000,
+          "iops": 10000,
           "delete_on_termination": true
         }
       ],
@@ -112,6 +113,14 @@
       ]
     },
     {
+      "type": "shell",
+      "inline": [
+        "echo 'Installing Hugging Face CLI (as ec2-user)...'",
+        "sudo -u ec2-user bash -c 'curl -LsSf https://hf.co/cli/install.sh | bash'",
+        "echo 'huggingface-cli installed (~/.local/bin for ec2-user)'"
+      ]
+    },
+    {
       "type": "file",
       "source": "ami/scripts/compressa-tests",
       "destination": "/tmp/compressa-tests"
@@ -141,6 +150,21 @@
         "sudo chmod +x /usr/local/bin/start.sh",
         "rm -f /tmp/start.sh",
         "echo 'Done: /usr/local/bin/start.sh'"
+      ]
+    },
+    {
+      "type": "file",
+      "source": "ami/scripts/gonka-user-data-main.sh",
+      "destination": "/tmp/gonka-user-data-main.sh"
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "echo 'Installing gonka-user-data-main.sh to /usr/local/bin...'",
+        "sudo cp /tmp/gonka-user-data-main.sh /usr/local/bin/gonka-user-data-main.sh",
+        "sudo chmod +x /usr/local/bin/gonka-user-data-main.sh",
+        "rm -f /tmp/gonka-user-data-main.sh",
+        "echo 'Done: /usr/local/bin/gonka-user-data-main.sh'"
       ]
     },
     {

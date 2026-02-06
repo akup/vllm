@@ -80,6 +80,9 @@ class CustomAllreduce:
         assert dist.get_backend(group) != dist.Backend.NCCL, (
             "CustomAllreduce should be attached to a non-NCCL group.")
 
+        logger.info(
+            "Custom all-reduce init: starting (single-node / in-the-same-node "
+            "check next).")
         if not all(in_the_same_node_as(group, source_rank=0)):
             # No need to initialize custom allreduce for multi-node case.
             logger.warning(
@@ -87,6 +90,9 @@ class CustomAllreduce:
                 " spans across nodes.")
             return
 
+        logger.info(
+            "Custom all-reduce init: single-node check done, gathering "
+            "device IDs (all_gather) next.")
         rank = dist.get_rank(group=self.group)
         self.rank = rank
         world_size = dist.get_world_size(group=self.group)
@@ -131,6 +137,9 @@ class CustomAllreduce:
         # where custom allreduce is not supported
         # this checks hardware and driver support for NVLink
         assert current_platform.is_cuda_alike()
+        logger.info(
+            "Custom all-reduce init: checking NVLink connectivity "
+            "(is_fully_connected) for devices %s.", physical_device_ids)
         fully_connected = current_platform.is_fully_connected(
             physical_device_ids)
         if world_size > 2 and not fully_connected:
@@ -143,6 +152,8 @@ class CustomAllreduce:
         # this is expensive to compute at the first time
         # then we cache the result
         # On AMD GPU, p2p is always enabled between XGMI connected GPUs
+        logger.info(
+            "Custom all-reduce init: checking P2P capability (_can_p2p) next.")
         if not current_platform.is_rocm() and not _can_p2p(rank, world_size):
             logger.warning(
                 "Custom allreduce is disabled because your platform lacks "

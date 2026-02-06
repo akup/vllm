@@ -34,6 +34,7 @@ def inference_up(base_url: str, model: str, tensor_parallel_size: Optional[int])
     additional_args.append("fastsafetensors")
     additional_args.append("--quantization")
     additional_args.append("fp8")
+    additional_args.append("--enforce-eager")
 
     payload = {
         "model": resolve_model(model),

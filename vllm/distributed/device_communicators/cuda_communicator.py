@@ -52,6 +52,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.ca_comm: Optional[CustomAllreduce] = None
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
+            logger.info(
+                "Creating custom all-reduce communicator (P2P/NVLink checks "
+                "may take a while on first run).")
             self.ca_comm = CustomAllreduce(
                 group=self.cpu_group,
                 device=self.device,

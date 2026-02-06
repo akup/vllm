@@ -20,6 +20,37 @@ INSTANCE_ID=i-080f709ab30281449 /data/compressa-tests/check-instance-ebs-iops.sh
 
 If IOPS/throughput are low, update your **launch template** so the root (or data) volume uses gp3 with e.g. **16,000 IOPS** and **1,000 MiB/s** (see `ami/README.md` → Fast disk (EBS IOPS)).
 
+### Why AMI/snapshot doesn’t speed startup
+
+On **reboot of the same instance**, startup is faster because the same EBS volume stays attached and (after a short burst) delivers full IOPS. When you **launch from an AMI or restore from a snapshot**, the new instance gets **new EBS volume(s)** created from that snapshot. Those volumes start **cold**: they don’t have warmed disk cache, and gp2/gp3 often exhibit a slow first-write/read period. So compilation/code caches on the snapshot don’t help if the bottleneck is **disk I/O** reading model weights. To get fast startup from a snapshot, use a **pre-warmed data volume** (see “Reusing a warm volume” in this doc) or higher provisioned IOPS.
+
+### Seeing what vLLM is doing during startup (silent gaps)
+
+vLLM can sit for a long time with no log lines while it opens files and reads weights from disk. To see per-shard and other detailed activity:
+
+- Set **`VLLM_LOGGING_LEVEL=DEBUG`** in the environment **before** starting the API (e.g. before `start.sh` or before uvicorn).  
+  Example: `export VLLM_LOGGING_LEVEL=DEBUG` then run `start.sh`. The vLLM subprocess inherits this and will log more (e.g. weight loading, file I/O).
+- `ami/start.sh` already exports `VLLM_LOGGING_LEVEL` from the environment with default `INFO`; override with `DEBUG` when debugging slow startup.
+- Running the **page-cache warm** (step 2) before starting the API reduces the “Loading weights” phase by pulling model files into Linux page cache first.
+
+**Why ~3 minutes of no vLLM logs after inference-up?**  
+During that time the vLLM process (and its engine subprocess) are doing **imports** and **early init** (loading torch, vllm, model config from disk) before the first log line. On a cold EBS volume that I/O is very slow, so nothing is printed until the first log is reached. The API runner now sets **`PYTHONUNBUFFERED=1`** for the vLLM subprocess so that when logs are emitted they appear immediately instead of being block-buffered.
+
+**Why another long gap after nccl, before “Starting to load model”?**  
+vLLM generates the **GPU P2P access cache** (e.g. `gpu_p2p_access_cache_for_0,1,2,3.json` in `VLLM_CACHE_ROOT`) the first time. That can take several minutes and produces little log until the cache is written. After that you see “Starting to load model” and weight loading.
+
+**Even with P2P check skipped, there can be a long gap after “vLLM is using nccl”.**  
+Between NCCL init and “Skipping P2P check” (or “Starting to load model”), the engine runs **custom all-reduce init**: single-node check (shared-memory), device-ID all_gather, **NVLink connectivity** (`is_fully_connected`), then P2P check (or skip). Any of these can be slow or block on the slowest worker. To see where time is spent, use **`VLLM_LOGGING_LEVEL=INFO`** (default): vLLM logs each step, e.g. “Creating custom all-reduce communicator…”, “Custom all-reduce init: starting (single-node check next).”, “single-node check done, gathering device IDs…”, “checking NVLink connectivity…”, “checking P2P capability next.”, then “Skipping P2P check…” if `VLLM_SKIP_P2P_CHECK=1`. The last log before a long pause shows which step is slow (e.g. single-node check, NVLink, or P2P).
+
+**What is the P2P cache and can I skip it?**  
+The cache stores the result of a **real GPU peer-to-peer (P2P) test** used by vLLM’s custom all-reduce (tensor-parallel communication). The test is slow (many subprocesses), so the result is cached. Options: (1) **Pre-populate**: run vLLM once, then ship the generated JSON in your AMI/volume so future runs just read it. (2) **Skip the check**: set **`VLLM_SKIP_P2P_CHECK=1`** so vLLM trusts the driver and does not run the test (no cache file); if P2P is broken, you may see failures later. (3) **Disable custom all-reduce**: use **`--disable-custom-all-reduce`** so vLLM uses NCCL only; no P2P check and no cache, at the cost of some possible all-reduce performance.
+
+`/data/vllm-cache/gpu_p2p_access_cache_for_0,1,2,3.json`
+`/data/vllm-cache/gpu_p2p_access_cache_for_4,5,6,7.json`
+
+**HF cache path: vLLM vs `hf download`.**  
+vLLM (and HuggingFace) expect the cache under **`HF_HOME/hub`** (e.g. `hub/models--Qwen--Qwen3-235B-A22B-Instruct-2507-FP8/...`). If you pre-download with **`hf download`** to a different layout (e.g. `/data/huggingface/Qwen-Qwen3-235B-A22B-Instruct-2507-FP8`), vLLM will not see it and will call `snapshot_download`, which can fill disk and fail. Use **`launch-download-model-volume.sh`** (it uses `snapshot_download` into the hub layout) or point vLLM at the local path: **`--model /data/huggingface/Qwen-Qwen3-235B-A22B-Instruct-2507-FP8`** (exact path may vary).
+
 ## 1. Launch a p6-b200.48xlarge instance
 
 Launch an instance from the API AMI (built with `packer build ami/packer-api.json`). Use instance type **p6-b200.48xlarge**.
@@ -186,6 +217,16 @@ sudo mount /dev/nvme1n1 /data || true
 ```
 
 Then `HF_HOME=/data/huggingface` and warm-page-cache use the warm volume. Root can stay from the AMI (small, fast boot); the warm data volume is reused so first I/O is much faster.
+
+**Creating a warm volume (launch → warm → terminate, keep volume):** Use the helper script to launch an instance with a large io2 root (same spec as packer-api: 350 GiB, 64000 IOPS), run warm-page-cache on it, then terminate the instance and keep the root volume (delete_on_termination=false). You then attach that volume ID to new instances via launch template.
+
+```bash
+# From a machine with AWS CLI and SSH key
+KEY_NAME=your-key SG_ID=sg-xxxxxxxx ./launch-warm-volume-instance.sh
+# Optional: AMI_ID=ami-xxx REGION=us-east-1 SUBNET_ID=subnet-xxx
+```
+
+Requires: model data under `/data/huggingface` on the instance (AMI or copy before running the script). The script SSHs into the instance and runs `/data/compressa-tests/warm-page-cache.sh`, then terminates the instance and prints the volume ID.
 
 **Spot instances:** Yes, you can reuse the same volume for **spot** instances. Attach the existing volume in the launch template (same block device mapping as above). When the spot is interrupted, the instance terminates but the **volume persists** (it’s a pre-existing volume, not created with the instance). Launch a new spot instance with the same launch template to reattach the same warm volume. Only one instance can have the volume attached at a time, so one warm volume per spot instance; use a fleet of volumes if you run many spots in parallel.
 

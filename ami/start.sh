@@ -77,6 +77,10 @@ fi
 # Build vLLM run args (native process, no Docker)
 export VLLM_USE_V1=0
 export HF_HOME="/data/huggingface"
+# Set VLLM_LOGGING_LEVEL=DEBUG before start.sh to see detailed weight-load/disk activity during startup
+# export VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-INFO}"
+export VLLM_LOGGING_LEVEL=DEBUG
+export VLLM_SKIP_P2P_CHECK=1
 
 HF_HOME="/data/huggingface"
 TENSOR_PARALLEL_SIZE=4

@@ -507,13 +507,20 @@ def fastsafetensors_weights_iterator(
         hf_weights_files[i:i + pg.size()]
         for i in range(0, len(hf_weights_files), pg.size())
     ]
+    total_shards = len(weight_files_sub_lists)
 
-    for f_list in tqdm(
+    for shard_idx, f_list in enumerate(tqdm(
             weight_files_sub_lists,
             desc="Loading safetensors using Fastsafetensor loader",
             disable=not enable_tqdm(use_tqdm_on_load),
             bar_format=_BAR_FORMAT,
-    ):
+    )):
+        # When tqdm is disabled (e.g. distributed), log progress so logs show activity
+        if not enable_tqdm(use_tqdm_on_load):
+            rank = pg.rank() if torch.distributed.is_initialized() else 0
+            if rank == 0:
+                logger.info("Loading weight shard %d/%d", shard_idx + 1,
+                            total_shards)
         loader = SafeTensorsFileLoader(pg, device)
         rank_file_map = {i: [f] for i, f in enumerate(f_list)}
         loader.add_filenames(rank_file_map)
