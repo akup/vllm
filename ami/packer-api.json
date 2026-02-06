@@ -154,6 +154,21 @@
     },
     {
       "type": "file",
+      "source": "ami/start-vllm.sh",
+      "destination": "/tmp/start-vllm.sh"
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "echo 'Installing start-vllm.sh to /usr/local/bin...'",
+        "sudo cp /tmp/start-vllm.sh /usr/local/bin/start-vllm.sh",
+        "sudo chmod +x /usr/local/bin/start-vllm.sh",
+        "rm -f /tmp/start-vllm.sh",
+        "echo 'Done: /usr/local/bin/start-vllm.sh'"
+      ]
+    },
+    {
+      "type": "file",
       "source": "ami/scripts/gonka-user-data-main.sh",
       "destination": "/tmp/gonka-user-data-main.sh"
     },

@@ -148,6 +148,11 @@ fi
 echo "SKIP_DOCKER: ${SKIP_DOCKER:-true}"
 if [ "${SKIP_DOCKER}" = "true" ]; then
   echo "SKIP_DOCKER is set to true - skipping Docker container startup"
+  echo "Starting without container"
+
+  /usr/local/bin/start-vllm.sh || {
+    echo "ERROR: start.sh failed, but continuing..."
+  }
 else
   echo "Waiting for Docker to be ready..."
   for i in $(seq 1 30); do

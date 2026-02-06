@@ -119,10 +119,19 @@ echo "[$(date +%H:%M:%S)] Uvicorn process launched (PID: $UVICORN_PID, launch to
 echo "Uvicorn logs: $UVICORN_LOG_DIR/uvicorn.log"
 
 # Start vLLM natively in background (PoC routes are in the overlay)
-# echo "Starting vLLM PoC server natively (port 8080)..."
-# /app/vllm-poc/.venv/bin/python -m vllm.entrypoints.openai.api_server $VLLM_ARGS &
-# VLLM_PID=$!
-# echo "vLLM started (PID $VLLM_PID). Waiting for /api/v1/state..."
+# Normally the API starts two vLLM backends (ports 5001, 5002) via inference-up; each uses 4 GPUs.
+# To start two vLLMs directly here with the same args, uncomment and use a venv that has vllm:
+#
+# VLLM_PYTHON="${VLLM_PYTHON_PATH:-/app/vllm-poc/.venv/bin/python}"
+# VLLM_BASE_ARGS="--host 0.0.0.0 --model $MODEL_NAME --dtype float16 --quantization fp8 --enforce-eager --load-format fastsafetensors --tensor-parallel-size $TENSOR_PARALLEL_SIZE"
+# echo "[$(date +%H:%M:%S)] Starting vLLM on port 5001 (GPUs 0-3)..."
+# PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0,1,2,3 $VLLM_PYTHON -m vllm.entrypoints.openai.api_server $VLLM_BASE_ARGS --port 5001 >> "$UVICORN_LOG_DIR/vllm-5001.log" 2>&1 &
+# VLLM_PID_1=$!
+# echo "[$(date +%H:%M:%S)] Starting vLLM on port 5002 (GPUs 4-7)..."
+# PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=4,5,6,7 $VLLM_PYTHON -m vllm.entrypoints.openai.api_server $VLLM_BASE_ARGS --port 5002 >> "$UVICORN_LOG_DIR/vllm-5002.log" 2>&1 &
+# VLLM_PID_2=$!
+# echo "vLLM started (PIDs $VLLM_PID_1, $VLLM_PID_2). Logs: $UVICORN_LOG_DIR/vllm-5001.log, vllm-5002.log"
+# (Then call the API to setup proxy with ports 5001,5002 so routes use these backends.)
 
 # Give uvicorn a moment to start the process
 sleep 1
