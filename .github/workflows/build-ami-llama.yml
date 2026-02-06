@@ -1,0 +1,70 @@
+# Build llama.cpp AMI (ami/packer-llama.json).
+# Same source AMI as vLLM: Deep Learning OSS Nvidia Driver AMI GPU PyTorch 2.9 (Amazon Linux 2023).
+#
+# Required repository secrets:
+#   AWS_AMI1_ACCESS_KEY_ID     - IAM access key for EC2/AMI
+#   AWS_AMI1_SECRET_ACCESS_KEY - IAM secret key
+#
+# Manual run: Actions -> Build llama.cpp AMI -> Run workflow.
+#   Select AWS region (default us-east-1) and optionally instance type.
+
+name: Build llama.cpp AMI
+
+on:
+  workflow_dispatch:
+    inputs:
+      aws_region:
+        description: "AWS region for AMI"
+        required: false
+        default: "us-east-1"
+      instance_type:
+        description: "EC2 instance type for build"
+        required: false
+        default: "g5.xlarge"
+
+jobs:
+  build-llama-ami:
+    name: Packer build llama.cpp AMI
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      AWS_REGION: ${{ github.event.inputs.aws_region || 'us-east-1' }}
+      PACKER_INSTANCE_TYPE: ${{ github.event.inputs.instance_type || 'g5.xlarge' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_AMI1_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_AMI1_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Packer
+        uses: hashicorp/setup-packer@main
+        with:
+          version: "1.11.0"
+
+      - name: Install Amazon (amazon-ebs) plugin
+        run: packer plugins install github.com/hashicorp/amazon
+
+      - name: Validate Packer template
+        run: |
+          packer validate \
+            -var "aws_region=${{ env.AWS_REGION }}" \
+            -var "instance_type=${{ env.PACKER_INSTANCE_TYPE }}" \
+            ami/packer-llama.json
+
+      - name: Build llama.cpp AMI
+        run: |
+          packer build \
+            -var "aws_region=${{ env.AWS_REGION }}" \
+            -var "instance_type=${{ env.PACKER_INSTANCE_TYPE }}" \
+            ami/packer-llama.json
+
+      - name: Output
+        if: success()
+        run: |
+          echo "llama.cpp AMI build finished. Check AWS EC2 Console -> AMIs (region ${{ env.AWS_REGION }}) for project-llama-cpp-ami-*"
